@@ -1,712 +1,561 @@
 
-from datetime import date, datetime, time, timedelta
-from hashlib import sha256
-from io import BytesIO
-from zoneinfo import ZoneInfo
+import hashlib
 import re
 import uuid
+from datetime import date, datetime, time, timedelta
+from io import BytesIO
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
 from streamlit_calendar import calendar
 from supabase import create_client
 
-
-# --------------------------------------------------
-# Configuration
-# --------------------------------------------------
-
 st.set_page_config(
-    page_title="Operations Planner",
+    page_title="Campey Transport Calendar",
     page_icon="📅",
     layout="wide",
 )
 
-COLOURS = {
-    "Campey": "#2ecc71",
-    "Bulk": "#3498db",
-    "Manual": "#ff9900",
+UK_TZ = ZoneInfo("Europe/London")
+SOURCE_OPTIONS = ["Campey", "Bulk", "Manual"]
+SOURCE_COLOURS = {
+    "Campey": "#2878B5",
+    "Bulk": "#D97706",
+    "Manual": "#64748B",
 }
 
-APP_TZ = ZoneInfo("Europe/London")
-
-DATE_NAMES = (
-    "date", "start date", "delivery date", "collection date",
-    "appointment date", "scheduled date", "job date",
-)
-
-START_NAMES = (
-    "start", "start datetime", "start date time",
-    "appointment", "scheduled start", "begin",
-)
-
-TIME_NAMES = (
-    "time", "start time", "arrival time", "collection time",
-)
-
-END_NAMES = (
-    "end", "end datetime", "finish", "end time", "finish time",
-)
-
-DURATION_NAMES = (
-    "duration", "hours", "duration hours", "length",
-)
-
-TITLE_NAMES = (
-    "title", "event", "description", "job", "job name",
-    "customer", "customer name", "site", "site name",
-    "order", "order number", "reference", "vehicle",
-)
-
-
-# --------------------------------------------------
-# Supabase database
-# --------------------------------------------------
 
 @st.cache_resource
 def get_supabase():
-    """Connect using credentials stored in Streamlit Secrets."""
-    try:
-        url = st.secrets["SUPABASE_URL"]
-        key = st.secrets["SUPABASE_SERVICE_ROLE_KEY"]
-    except KeyError as exc:
-        raise RuntimeError(
-            "Supabase secrets are missing. Add SUPABASE_URL and "
-            "SUPABASE_SERVICE_ROLE_KEY under Streamlit Settings > Secrets."
-        ) from exc
-
-    return create_client(str(url), str(key))
+    url = st.secrets.get("SUPABASE_URL", "").strip()
+    key = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    if not url or not key:
+        return None
+    return create_client(url, key)
 
 
-def db_datetime(value):
-    """Store calendar times with the correct UK timezone."""
+def local_now():
+    return datetime.now(UK_TZ)
+
+
+def db_timestamp(value):
+    if isinstance(value, str):
+        value = pd.to_datetime(value, errors="raise").to_pydatetime()
+    if isinstance(value, date) and not isinstance(value, datetime):
+        value = datetime.combine(value, time.min)
     if value.tzinfo is None:
-        value = value.replace(tzinfo=APP_TZ)
-    else:
-        value = value.astimezone(APP_TZ)
-
-    return value.isoformat()
+        value = value.replace(tzinfo=UK_TZ)
+    return value.astimezone(UK_TZ).isoformat()
 
 
-def init_db():
-    # The database tables have already been created in Supabase.
-    get_supabase()
+def as_local_datetime(value):
+    if not value:
+        return None
+    result = pd.to_datetime(value, errors="coerce")
+    if pd.isna(result):
+        return None
+    result = result.to_pydatetime()
+    if result.tzinfo is None:
+        result = result.replace(tzinfo=UK_TZ)
+    return result.astimezone(UK_TZ)
 
 
-def get_events():
-    response = (
-        get_supabase()
-        .table("events")
+def fetch_events(db):
+    return (
+        db.table("events")
         .select("*")
         .order("start")
         .execute()
+        .data
+        or []
     )
 
-    events = []
 
-    for row in response.data or []:
-        colour = row.get("colour") or "#3498db"
-
-        events.append({
-            "id": row["id"],
-            "title": row["title"],
-            "start": row["start"],
-            "end": row.get("end"),
-            "backgroundColor": colour,
-            "borderColor": colour,
-            "extendedProps": {
-                "source": row.get("source") or "Manual",
-            },
-        })
-
-    return events
-
-
-def add_event(title, start, end, colour, source="Manual"):
-    event_id = str(uuid.uuid4())
-
-    get_supabase().table("events").insert({
-        "id": event_id,
-        "title": title,
-        "start": db_datetime(start),
-        "end": db_datetime(end),
-        "colour": colour,
+def insert_event(db, title, start_dt, end_dt=None, source="Manual"):
+    source = source if source in SOURCE_OPTIONS else "Manual"
+    db.table("events").insert({
+        "id": str(uuid.uuid4()),
+        "title": title.strip(),
+        "start": db_timestamp(start_dt),
+        "end": db_timestamp(end_dt) if end_dt else None,
+        "colour": SOURCE_COLOURS[source],
         "source": source,
     }).execute()
 
-    return event_id
+
+def update_event(db, event_id, title, start_dt, end_dt=None, source="Manual"):
+    source = source if source in SOURCE_OPTIONS else "Manual"
+    db.table("events").update({
+        "title": title.strip(),
+        "start": db_timestamp(start_dt),
+        "end": db_timestamp(end_dt) if end_dt else None,
+        "colour": SOURCE_COLOURS[source],
+        "source": source,
+    }).eq("id", event_id).execute()
 
 
-def update_event(event_id, start, end):
-    get_supabase().table("events").update({
-        "start": db_datetime(start),
-        "end": db_datetime(end),
-    }).eq("id", str(event_id)).execute()
+def delete_event(db, event_id):
+    db.table("events").delete().eq("id", event_id).execute()
 
 
-def delete_event(event_id):
-    get_supabase().table("events").delete().eq(
-        "id", str(event_id)
-    ).execute()
+# Excel importer for the existing Campey Transport Requests workbook
+
+def clean(value):
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip()
 
 
-def clear_calendar():
-    get_supabase().table("events").delete().neq(
-        "id", ""
-    ).execute()
-
-    get_supabase().table("imported_files").delete().neq(
-        "file_hash", ""
-    ).execute()
+def normalise(value):
+    return re.sub(r"\s+", " ", clean(value).lower()).strip()
 
 
-def imported_hash(content_hash):
-    response = (
-        get_supabase()
-        .table("imported_files")
+def parse_excel_date(value):
+    if value is None or clean(value) == "":
+        return None
+    try:
+        parsed = pd.to_datetime(value, errors="coerce")
+        return None if pd.isna(parsed) else parsed.date()
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def parse_excel_time(value):
+    if value is None or clean(value) == "":
+        return None
+
+    if isinstance(value, datetime):
+        return value.time().replace(second=0, microsecond=0)
+    if isinstance(value, time):
+        return value.replace(second=0, microsecond=0)
+    if isinstance(value, timedelta):
+        minutes = int(value.total_seconds() // 60) % 1440
+        return time(minutes // 60, minutes % 60)
+    if isinstance(value, (int, float)) and 0 <= float(value) < 1:
+        minutes = round(float(value) * 1440) % 1440
+        return time(minutes // 60, minutes % 60)
+
+    try:
+        parsed = pd.to_datetime(str(value).strip(), errors="coerce")
+        return None if pd.isna(parsed) else parsed.time().replace(
+            second=0, microsecond=0
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def parse_workbook(content, filename):
+    events = []
+    warnings = []
+
+    try:
+        workbook = pd.ExcelFile(BytesIO(content))
+    except Exception as exc:
+        return [], [f"Could not open {filename}: {exc}"]
+
+    for sheet_name in workbook.sheet_names:
+        try:
+            raw = pd.read_excel(
+                workbook, sheet_name=sheet_name, header=None
+            )
+
+            # Find the actual header row instead of assuming row 1.
+            header_row = None
+            for row_index in range(min(len(raw), 25)):
+                headings = {
+                    normalise(value)
+                    for value in raw.iloc[row_index].tolist()
+                }
+                if "date" in headings and "planned time" in headings:
+                    header_row = row_index
+                    break
+
+            if header_row is None:
+                warnings.append(
+                    f"{sheet_name}: couldn't find Date and Planned Time "
+                    "headings; skipped this sheet."
+                )
+                continue
+
+            frame = pd.read_excel(
+                workbook, sheet_name=sheet_name, header=header_row
+            )
+
+            columns = {}
+            for column in frame.columns:
+                key = normalise(column)
+                if key and key not in columns:
+                    columns[key] = column
+
+            date_col = columns.get("date")
+            time_col = columns.get("planned time")
+            site_col = columns.get("del site")
+
+            if date_col is None or time_col is None:
+                warnings.append(
+                    f"{sheet_name}: required columns are missing."
+                )
+                continue
+
+            sheet_count = 0
+
+            for _, row in frame.iterrows():
+                booking_date = parse_excel_date(row.get(date_col))
+                booking_time = parse_excel_time(row.get(time_col))
+
+                # Ignore blank rows and summary sections without a date/time.
+                if booking_date is None or booking_time is None:
+                    continue
+
+                site = clean(row.get(site_col)) if site_col else ""
+                if not site:
+                    site = "Transport booking"
+
+                start_dt = datetime.combine(
+                    booking_date, booking_time
+                ).replace(tzinfo=UK_TZ)
+
+                events.append({
+                    "id": str(uuid.uuid4()),
+                    "title": site,
+                    "start": start_dt.isoformat(),
+                    "end": None,
+                    "colour": SOURCE_COLOURS["Campey"],
+                    "source": "Campey",
+                })
+                sheet_count += 1
+
+            if sheet_count == 0:
+                warnings.append(
+                    f"{sheet_name}: no valid bookings found."
+                )
+
+        except Exception as exc:
+            warnings.append(
+                f"{sheet_name}: couldn't read worksheet ({exc})."
+            )
+
+    return events, warnings
+
+
+def import_workbook(db, uploaded_file):
+    content = uploaded_file.getvalue()
+    file_hash = hashlib.sha256(content).hexdigest()
+
+    existing = (
+        db.table("imported_files")
         .select("file_hash")
-        .eq("file_hash", content_hash)
+        .eq("file_hash", file_hash)
         .limit(1)
         .execute()
     )
 
-    return bool(response.data)
+    if existing.data:
+        return 0, [
+            "This exact file has already been imported. No duplicates added."
+        ]
+
+    events, warnings = parse_workbook(content, uploaded_file.name)
+
+    if not events:
+        return 0, warnings or ["No valid bookings were found."]
+
+    # Save bookings first, then record the import hash.
+    db.table("events").insert(events).execute()
+    db.table("imported_files").insert({
+        "file_hash": file_hash,
+        "filename": uploaded_file.name,
+        "imported_at": local_now().isoformat(),
+    }).execute()
+
+    return len(events), warnings
 
 
-def save_import(filename, content_hash, events):
-    rows = []
-
-    for event in events:
-        rows.append({
-            "id": str(uuid.uuid4()),
-            "title": event["title"],
-            "start": db_datetime(event["start"]),
-            "end": db_datetime(event["end"]),
-            "colour": event["colour"],
-            "source": event["source"],
-        })
-
-    if rows:
-        get_supabase().table("events").insert(rows).execute()
-
-    get_supabase().table("imported_files").upsert(
-        {
-            "file_hash": content_hash,
-            "filename": filename,
-        },
-        on_conflict="file_hash",
-    ).execute()
-
-
-# --------------------------------------------------
-# Excel parsing helpers
-# --------------------------------------------------
-
-def normalise(value):
-    text = str(value).strip().lower()
-    text = re.sub(r"[_\-]+", " ", text)
-    text = re.sub(r"\s+", " ", text)
-    return text
-
-
-def find_column(columns, candidates, contains=False):
-    normalised = {
-        column: normalise(column)
-        for column in columns
+def to_calendar_event(event):
+    colour = event.get("colour") or SOURCE_COLOURS.get(
+        event.get("source", "Manual"), SOURCE_COLOURS["Manual"]
+    )
+    result = {
+        "id": str(event.get("id", "")),
+        "title": event.get("title") or "Untitled",
+        "start": event.get("start"),
+        "backgroundColor": colour,
+        "borderColor": colour,
+        "textColor": "#FFFFFF",
     }
-
-    for candidate in candidates:
-        candidate = normalise(candidate)
-
-        for column, name in normalised.items():
-            if name == candidate:
-                return column
-
-    if contains:
-        for candidate in candidates:
-            candidate = normalise(candidate)
-
-            for column, name in normalised.items():
-                if candidate in name:
-                    return column
-
-    return None
-
-
-def valid_value(value):
-    if value is None:
-        return False
-
-    try:
-        if pd.isna(value):
-            return False
-    except (TypeError, ValueError):
-        pass
-
-    return str(value).strip() != ""
-
-
-def parse_datetime(value):
-    if not valid_value(value):
-        return None
-
-    try:
-        result = pd.to_datetime(value, errors="coerce")
-    except (ValueError, TypeError, OverflowError):
-        return None
-
-    if pd.isna(result):
-        return None
-
-    result = result.to_pydatetime()
-
-    if result.tzinfo is not None:
-        result = result.astimezone(APP_TZ).replace(tzinfo=None)
-
+    if event.get("end"):
+        result["end"] = event["end"]
     return result
 
 
-def parse_time(value):
-    if not valid_value(value):
-        return None
+# Main application
 
-    if isinstance(value, time):
-        return value.replace(tzinfo=None)
+st.title("Campey Transport Calendar")
+st.caption("Shared transport bookings • UK time")
 
-    if isinstance(value, datetime):
-        return value.time().replace(tzinfo=None)
-
-    if isinstance(value, (int, float)) and 0 <= value < 1:
-        seconds = int(round(value * 24 * 60 * 60))
-        seconds %= 24 * 60 * 60
-        return (datetime.min + timedelta(seconds=seconds)).time()
-
-    parsed = parse_datetime(value)
-
-    if parsed is not None:
-        return parsed.time()
-
-    return None
-
-
-def parse_workbook(content, filename):
-    source = "Campey" if "campey" in filename.lower() else "Bulk"
-    colour = COLOURS[source]
-    workbook = pd.ExcelFile(BytesIO(content))
-
-    parsed_events = []
-    errors = []
-
-    for sheet_name in workbook.sheet_names:
-        try:
-            df = pd.read_excel(workbook, sheet_name=sheet_name)
-        except Exception as exc:
-            errors.append(f"{sheet_name}: couldn't read sheet ({exc})")
-            continue
-
-        if df.empty:
-            continue
-
-        df.columns = [str(column).strip() for column in df.columns]
-
-        start_col = find_column(df.columns, START_NAMES, contains=True)
-        date_col = find_column(df.columns, DATE_NAMES, contains=True)
-        time_col = find_column(df.columns, TIME_NAMES, contains=True)
-        end_col = find_column(df.columns, END_NAMES, contains=True)
-        duration_col = find_column(
-            df.columns, DURATION_NAMES, contains=True
-        )
-        title_col = find_column(df.columns, TITLE_NAMES, contains=True)
-
-        if start_col is None:
-            start_col = date_col
-
-        if start_col is None:
-            errors.append(
-                f"{sheet_name}: no recognised date/start column. "
-                "Check the spreadsheet headers."
-            )
-            continue
-
-        sheet_events = 0
-
-        for _, row in df.iterrows():
-            start_dt = parse_datetime(row.get(start_col))
-
-            if start_dt is None:
-                continue
-
-            if (
-                date_col is not None
-                and time_col is not None
-                and date_col != start_col
-            ):
-                parsed_start_time = parse_time(row.get(time_col))
-
-                if parsed_start_time is not None:
-                    start_dt = datetime.combine(
-                        start_dt.date(), parsed_start_time
-                    )
-
-            end_dt = None
-
-            if end_col is not None and valid_value(row.get(end_col)):
-                end_value = row.get(end_col)
-                parsed_end_time = parse_time(end_value)
-
-                if (
-                    isinstance(end_value, time)
-                    or (
-                        isinstance(end_value, (int, float))
-                        and 0 <= end_value < 1
-                    )
-                ):
-                    if parsed_end_time is not None:
-                        end_dt = datetime.combine(
-                            start_dt.date(), parsed_end_time
-                        )
-                else:
-                    end_dt = parse_datetime(end_value)
-
-                    if (
-                        end_dt is not None
-                        and end_dt.date() != start_dt.date()
-                        and parsed_end_time is not None
-                    ):
-                        end_dt = datetime.combine(
-                            start_dt.date(), parsed_end_time
-                        )
-
-            elif (
-                duration_col is not None
-                and valid_value(row.get(duration_col))
-            ):
-                try:
-                    hours = float(row.get(duration_col))
-                    if hours > 0:
-                        end_dt = start_dt + timedelta(hours=hours)
-                except (ValueError, TypeError, OverflowError):
-                    end_dt = None
-
-            if end_dt is None or end_dt <= start_dt:
-                end_dt = start_dt + timedelta(hours=1)
-
-            title = None
-
-            if title_col is not None and valid_value(row.get(title_col)):
-                title = str(row.get(title_col)).strip()
-
-            if not title:
-                values = [
-                    str(value).strip()
-                    for value in row.tolist()
-                    if valid_value(value)
-                ]
-                title = " - ".join(values[:3])
-
-            if not title:
-                title = f"{source} event"
-
-            parsed_events.append({
-                "title": title[:200],
-                "start": start_dt,
-                "end": end_dt,
-                "colour": colour,
-                "source": source,
-            })
-
-            sheet_events += 1
-
-        if sheet_events == 0:
-            errors.append(f"{sheet_name}: no valid events found.")
-
-    return parsed_events, errors
-
-
-# --------------------------------------------------
-# Initialise app
-# --------------------------------------------------
-
-init_db()
-
-st.title("📅 Operations Planner")
-st.caption(
-    "Plan, import and manage your scheduled work in one calendar."
-)
-
-
-# --------------------------------------------------
-# Sidebar: import schedules
-# --------------------------------------------------
+db = get_supabase()
+if db is None:
+    st.error(
+        "Supabase secrets are missing. Open Streamlit app Settings → "
+        "Secrets and configure SUPABASE_URL and "
+        "SUPABASE_SERVICE_ROLE_KEY."
+    )
+    st.stop()
 
 with st.sidebar:
-    st.header("Import schedules")
-
-    uploaded_files = st.file_uploader(
-        "Upload Excel schedules",
-        type=["xlsx", "xlsm", "xls"],
-        accept_multiple_files=True,
+    st.header("Calendar")
+    selected_date = st.date_input(
+        "Focus date", value=local_now().date()
     )
-
-    if uploaded_files:
-        for uploaded_file in uploaded_files:
-            content = uploaded_file.getvalue()
-            content_hash = sha256(content).hexdigest()
-
-            if imported_hash(content_hash):
-                st.info(f"Already imported: {uploaded_file.name}")
-                continue
-
-            with st.spinner(f"Importing {uploaded_file.name}..."):
-                try:
-                    events, errors = parse_workbook(
-                        content, uploaded_file.name
-                    )
-
-                    if events:
-                        save_import(
-                            uploaded_file.name,
-                            content_hash,
-                            events,
-                        )
-                        st.success(
-                            f"Imported {len(events)} events "
-                            f"from {uploaded_file.name}."
-                        )
-                    else:
-                        st.warning(
-                            f"No events imported from {uploaded_file.name}."
-                        )
-
-                    for error in errors:
-                        st.warning(error)
-
-                except Exception as exc:
-                    st.error(
-                        f"Could not import {uploaded_file.name}: {exc}"
-                    )
-
+    view_mode = st.selectbox(
+        "Calendar view",
+        ["dayGridMonth", "timeGridWeek", "timeGridDay", "listWeek"],
+        format_func=lambda value: {
+            "dayGridMonth": "Month",
+            "timeGridWeek": "Week",
+            "timeGridDay": "Day",
+            "listWeek": "List",
+        }[value],
+    )
     st.divider()
-    st.header("Add an event")
-
-    with st.form("manual_event_form", clear_on_submit=True):
-        event_title = st.text_input("Event title")
-
-        event_date = st.date_input("Date", value=date.today())
-        event_start_time = st.time_input(
-            "Start time", value=time(9, 0)
-        )
-        event_duration = st.number_input(
-            "Duration (hours)",
-            min_value=0.25,
-            max_value=168.0,
-            value=1.0,
-            step=0.25,
-        )
-        event_colour = st.selectbox(
-            "Colour",
-            options=list(COLOURS.keys()),
-            index=2,
+    st.markdown("**Event colours**")
+    for source, colour in SOURCE_COLOURS.items():
+        st.markdown(
+            f'<span style="display:inline-block;width:10px;height:10px;'
+            f'background:{colour};border-radius:50%;margin-right:7px;"></span>'
+            f'{source}',
+            unsafe_allow_html=True,
         )
 
+try:
+    events = fetch_events(db)
+except Exception as exc:
+    st.error(f"Couldn't load bookings from Supabase: {exc}")
+    st.stop()
+
+calendar_tab, add_tab, manage_tab, import_tab = st.tabs([
+    "Calendar", "Add booking", "Manage bookings", "Import Excel"
+])
+
+with calendar_tab:
+    calendar(
+        events=[to_calendar_event(event) for event in events],
+        options={
+            "initialView": view_mode,
+            "initialDate": selected_date.isoformat(),
+            "headerToolbar": {
+                "left": "prev,next today",
+                "center": "title",
+                "right": "dayGridMonth,timeGridWeek,timeGridDay,listWeek",
+            },
+            "editable": False,
+            "selectable": False,
+            "height": 720,
+            "nowIndicator": True,
+            "dayMaxEvents": True,
+            "timeZone": "local",
+            "eventTimeFormat": {
+                "hour": "2-digit",
+                "minute": "2-digit",
+                "hour12": False,
+            },
+        },
+        key="transport_calendar",
+    )
+    st.caption(
+        f"{len(events)} bookings total. Imported titles show the delivery "
+        "site only; pallet counts are ignored."
+    )
+
+with add_tab:
+    st.subheader("Add a booking")
+    with st.form("add_booking_form", clear_on_submit=True):
+        title = st.text_input(
+            "Delivery site / booking title",
+            placeholder="Campey or DHL",
+        )
+        col1, col2 = st.columns(2)
+        booking_date = col1.date_input("Date", value=selected_date)
+        booking_time = col2.time_input(
+            "Planned time", value=time(9, 0)
+        )
+        col3, col4 = st.columns(2)
+        source = col3.selectbox("Source", SOURCE_OPTIONS, index=2)
+        has_end = col4.checkbox("Add an end time")
+        end_time = st.time_input(
+            "End time", value=time(10, 0), disabled=not has_end
+        )
         submitted = st.form_submit_button(
-            "Add event", use_container_width=True
+            "Save booking", type="primary"
         )
 
-        if submitted:
-            if not event_title.strip():
-                st.error("Please enter an event title.")
-            else:
-                start_dt = datetime.combine(
-                    event_date, event_start_time
-                )
-                end_dt = start_dt + timedelta(
-                    hours=float(event_duration)
-                )
-
-                add_event(
-                    event_title.strip(),
-                    start_dt,
-                    end_dt,
-                    COLOURS[event_colour],
-                    source="Manual",
-                )
-
-                st.success("Event added.")
+    if submitted:
+        if not title.strip():
+            st.error("Enter a delivery site or booking title.")
+        elif has_end and end_time <= booking_time:
+            st.error("End time must be later than start time.")
+        else:
+            start_dt = datetime.combine(
+                booking_date, booking_time
+            ).replace(tzinfo=UK_TZ)
+            end_dt = (
+                datetime.combine(booking_date, end_time).replace(tzinfo=UK_TZ)
+                if has_end else None
+            )
+            try:
+                insert_event(db, title, start_dt, end_dt, source)
+                st.success("Booking added.")
                 st.rerun()
+            except Exception as exc:
+                st.error(f"Could not save booking: {exc}")
 
+with manage_tab:
+    st.subheader("Edit or delete a booking")
 
-# --------------------------------------------------
-# Load and filter events
-# --------------------------------------------------
+    if not events:
+        st.info("There are no bookings to manage yet.")
+    else:
+        event_by_label = {}
+        for event in events:
+            start_dt = as_local_datetime(event.get("start"))
+            start_label = (
+                start_dt.strftime("%d %b %Y %H:%M")
+                if start_dt else "No date"
+            )
+            label = (
+                f"{start_label} — {event.get('title', 'Untitled')} "
+                f"[{event.get('source', 'Manual')}]"
+            )
+            if label in event_by_label:
+                label += f" — {str(event.get('id', ''))[:8]}"
+            event_by_label[label] = event
 
-all_events = get_events()
+        chosen_label = st.selectbox(
+            "Choose booking", list(event_by_label.keys())
+        )
+        chosen = event_by_label[chosen_label]
+        chosen_start = as_local_datetime(chosen.get("start")) or local_now()
+        chosen_end = as_local_datetime(chosen.get("end"))
 
-col1, col2, col3 = st.columns(3)
+        with st.form("edit_booking_form"):
+            edit_title = st.text_input(
+                "Title", value=chosen.get("title", "")
+            )
+            col1, col2 = st.columns(2)
+            edit_date = col1.date_input(
+                "Date", value=chosen_start.date()
+            )
+            edit_time = col2.time_input(
+                "Planned time",
+                value=chosen_start.time().replace(
+                    tzinfo=None, second=0, microsecond=0
+                ),
+            )
+            col3, col4 = st.columns(2)
+            current_source = chosen.get("source", "Manual")
+            if current_source not in SOURCE_OPTIONS:
+                current_source = "Manual"
+            edit_source = col3.selectbox(
+                "Source",
+                SOURCE_OPTIONS,
+                index=SOURCE_OPTIONS.index(current_source),
+            )
+            has_end = col4.checkbox(
+                "Has end time", value=chosen_end is not None
+            )
+            edit_end_time = st.time_input(
+                "End time",
+                value=(
+                    chosen_end.time().replace(
+                        tzinfo=None, second=0, microsecond=0
+                    ) if chosen_end else time(10, 0)
+                ),
+                disabled=not has_end,
+            )
+            save_edit = st.form_submit_button(
+                "Save changes", type="primary"
+            )
 
-col1.metric("Total events", len(all_events))
-col2.metric(
-    "Imported events",
-    sum(
-        1 for event in all_events
-        if event["extendedProps"]["source"] != "Manual"
-    ),
-)
-col3.metric(
-    "Manual events",
-    sum(
-        1 for event in all_events
-        if event["extendedProps"]["source"] == "Manual"
-    ),
-)
+        if save_edit:
+            if not edit_title.strip():
+                st.error("Title cannot be blank.")
+            elif has_end and edit_end_time <= edit_time:
+                st.error("End time must be later than start time.")
+            else:
+                new_start = datetime.combine(
+                    edit_date, edit_time
+                ).replace(tzinfo=UK_TZ)
+                new_end = (
+                    datetime.combine(edit_date, edit_end_time).replace(
+                        tzinfo=UK_TZ
+                    ) if has_end else None
+                )
+                try:
+                    update_event(
+                        db, chosen["id"], edit_title, new_start,
+                        new_end, edit_source
+                    )
+                    st.success("Booking updated.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not update booking: {exc}")
 
-filter_col1, filter_col2 = st.columns([2, 1])
+        st.divider()
+        st.warning(
+            f"Delete **{chosen.get('title', 'this booking')}**?"
+        )
+        confirmed = st.checkbox(
+            "I understand this permanently deletes the selected booking.",
+            key=f"confirm_delete_{chosen.get('id')}",
+        )
+        if st.button(
+            "Delete selected booking",
+            disabled=not confirmed,
+        ):
+            try:
+                delete_event(db, chosen["id"])
+                st.success("Booking deleted.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not delete booking: {exc}")
 
-with filter_col1:
-    search_text = st.text_input(
-        "Search events", placeholder="Search by title..."
+with import_tab:
+    st.subheader("Import transport requests")
+    st.write(
+        "Upload your original Excel workbook as-is. The importer finds "
+        "the Date and Planned Time headings on each worksheet and uses "
+        "Del Site as the event title. Pallet counts are ignored."
     )
 
-with filter_col2:
-    source_filter = st.selectbox(
-        "Show source", ["All", "Campey", "Bulk", "Manual"]
+    uploaded = st.file_uploader(
+        "Choose an Excel workbook",
+        type=["xlsx", "xlsm", "xls"],
+        help="The exact same file will not be imported twice.",
     )
 
-events = []
-
-for event in all_events:
-    source = event["extendedProps"]["source"]
-
-    if source_filter != "All" and source != source_filter:
-        continue
-
-    if (
-        search_text.strip()
-        and search_text.lower() not in event["title"].lower()
-    ):
-        continue
-
-    events.append(event)
-
-
-# --------------------------------------------------
-# Calendar
-# --------------------------------------------------
-
-st.subheader("Schedule calendar")
-st.caption(
-    "Drag an event to reschedule it. "
-    "Use the buttons above the calendar to change views."
-)
-
-calendar_options = {
-    "initialView": "dayGridMonth",
-    "headerToolbar": {
-        "left": "prev,next today",
-        "center": "title",
-        "right": "dayGridMonth,timeGridWeek,timeGridDay",
-    },
-    "height": 700,
-    "contentHeight": 650,
-    "editable": True,
-    "selectable": True,
-    "nowIndicator": True,
-    "slotMinTime": "06:00:00",
-    "slotMaxTime": "30:00:00",
-    "dayMaxEvents": True,
-    "navLinks": True,
-}
-
-calendar_state = calendar(
-    events=events,
-    options=calendar_options,
-    custom_css="""
-        .fc {
-            min-height: 650px;
-        }
-
-        .fc .fc-toolbar-title {
-            font-size: 1.2rem;
-        }
-    """,
-    callbacks=["eventChange"],
-    key="operations_calendar",
-)
-
-
-# --------------------------------------------------
-# Persist drag-and-drop changes
-# --------------------------------------------------
-
-if isinstance(calendar_state, dict):
-    if calendar_state.get("callback") == "eventChange":
-        change_data = calendar_state.get("eventChange", {})
-        changed_event = change_data.get("event", {})
-
-        event_id = changed_event.get("id")
-        new_start = parse_datetime(changed_event.get("start"))
-        new_end = parse_datetime(changed_event.get("end"))
-
-        if event_id and new_start:
-            if new_end is None or new_end <= new_start:
-                new_end = new_start + timedelta(hours=1)
-
-            update_event(event_id, new_start, new_end)
-            st.rerun()
-
-
-# --------------------------------------------------
-# Delete events
-# --------------------------------------------------
+    if uploaded is not None:
+        st.write(f"Selected file: **{uploaded.name}**")
+        if st.button("Import bookings", type="primary"):
+            with st.spinner("Reading workbook and saving bookings..."):
+                try:
+                    count, warnings = import_workbook(db, uploaded)
+                    if count:
+                        st.success(f"Imported {count} bookings.")
+                    for warning in warnings:
+                        st.warning(warning)
+                    if count:
+                        st.rerun()
+                except Exception as exc:
+                    st.error(f"Import failed: {exc}")
 
 st.divider()
-st.subheader("Manage events")
-
-if not all_events:
-    st.info(
-        "No events yet. Add one from the sidebar "
-        "or import an Excel schedule."
-    )
-else:
-    event_options = {}
-
-    for event in all_events:
-        start_dt = parse_datetime(event["start"])
-        display_start = (
-            start_dt.strftime("%d %b %Y %H:%M")
-            if start_dt
-            else event["start"]
-        )
-
-        source = event["extendedProps"]["source"]
-        label = f"{display_start} — {event['title']} ({source})"
-        event_options[label + f" [{event['id'][:8]}]"] = event["id"]
-
-    selected_label = st.selectbox(
-        "Choose an event to delete",
-        options=list(event_options.keys()),
-    )
-
-    if st.button("Delete selected event", type="secondary"):
-        delete_event(event_options[selected_label])
-        st.success("Event deleted.")
-        st.rerun()
-
-
-# --------------------------------------------------
-# Clear calendar
-# --------------------------------------------------
-
-with st.expander("Advanced: clear the calendar"):
-    st.warning(
-        "This removes all events and import records from the database."
-    )
-
-    confirm_clear = st.checkbox(
-        "I understand that this cannot be undone."
-    )
-
-    if st.button("Clear all events", disabled=not confirm_clear):
-        clear_calendar()
-        st.success("Calendar cleared.")
-        st.rerun()
+st.caption(
+    "Bookings are shared through Supabase. Keep your service-role key "
+    "in Streamlit Secrets only; never commit it to GitHub."
+)
