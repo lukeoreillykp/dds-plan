@@ -1,41 +1,6 @@
-import streamlit as st
-import pandas as pd
-import sqlite3
-import uuid
+FIXES TO APPLY TO YOUR WORKING app.py
 
-from datetime import datetime, timedelta
-from streamlit_calendar import calendar
-
-DB = "scheduler.db"
-
-
-# ==================================================
-# DATABASE
-# ==================================================
-
-@st.cache_resource
-def get_connection():
-    return sqlite3.connect(
-        DB,
-        check_same_thread=False
-    )
-
-
-def init_db():
-
-    conn = get_connection()
-    cur = conn.cursor()
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS events(
-        id TEXT PRIMARY KEY,
-        title TEXT,
-        start TEXT,
-        end TEXT,
-        colour TEXT,
-        source TEXT
-    )
-    """)
+1. In init_db() add imported_files table:
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS imported_files(
@@ -43,13 +8,12 @@ def init_db():
     )
     """)
 
-    conn.commit()
+2. Add after init_db():
 
 
-def file_already_imported(filename):
+def file_imported(filename):
 
-    conn = get_connection()
-
+    conn = sqlite3.connect(DB)
     cur = conn.cursor()
 
     cur.execute(
@@ -57,13 +21,16 @@ def file_already_imported(filename):
         (filename,)
     )
 
-    return cur.fetchone() is not None
+    result = cur.fetchone()
+
+    conn.close()
+
+    return result is not None
 
 
-def mark_imported(filename):
+def mark_file_imported(filename):
 
-    conn = get_connection()
-
+    conn = sqlite3.connect(DB)
     cur = conn.cursor()
 
     cur.execute(
@@ -72,152 +39,79 @@ def mark_imported(filename):
     )
 
     conn.commit()
+    conn.close()
 
+3. Replace:
 
-def add_event(event):
+except:
+    pass
 
-    conn = get_connection()
+with:
 
-    cur = conn.cursor()
+except Exception as e:
+    st.error(f"Campey import error: {e}")
 
-    cur.execute("""
-    INSERT OR REPLACE INTO events
-    VALUES(?,?,?,?,?,?)
-    """, (
-        event["id"],
-        event["title"],
-        event["start"],
-        event["end"],
-        event["backgroundColor"],
-        event["source"]
-    ))
+in parse_campey()
 
-    conn.commit()
+4. Replace:
 
+except:
+    pass
 
-def update_event(
-    event_id,
-    title,
-    start,
-    end,
-    colour
-):
+with:
 
-    conn = get_connection()
+except Exception as e:
+    st.error(f"Bulk import error: {e}")
 
-    cur = conn.cursor()
+in parse_bulk()
 
-    cur.execute("""
-    UPDATE events
-    SET title=?,
-        start=?,
-        end=?,
-        colour=?
-    WHERE id=?
-    """, (
-        title,
-        start,
-        end,
-        colour,
-        event_id
-    ))
+5. In the upload section, change:
 
-    conn.commit()
+for file in files:
 
+To:
 
-def delete_event(event_id):
+for file in files:
 
-    conn = get_connection()
+    if file_imported(file.name):
+        st.sidebar.warning(
+            f"{file.name} already imported"
+        )
+        continue
 
-    cur = conn.cursor()
+6. After:
 
-    cur.execute(
-        "DELETE FROM events WHERE id=?",
-        (event_id,)
-    )
+for e in events:
+    add_event(e)
 
-    conn.commit()
+Add:
 
+mark_file_imported(file.name)
 
-def clear_database():
+7. Add a clear calendar button after:
 
-    conn = get_connection()
+st.sidebar.header("Upload")
 
+Add:
+
+if st.sidebar.button("Clear Calendar"):
+
+    conn = sqlite3.connect(DB)
     cur = conn.cursor()
 
     cur.execute("DELETE FROM events")
     cur.execute("DELETE FROM imported_files")
 
     conn.commit()
+    conn.close()
 
+    st.rerun()
 
-def get_events():
+8. Ensure this line exists in parse_bulk():
 
-    conn = get_connection()
+if len(txt.strip()) < 10:
+    continue
 
-    df = pd.read_sql(
-        "SELECT * FROM events",
-        conn
-    )
+NOT:
 
-    if df.empty:
-        return []
-
-    events = []
-
-    for _, row in df.iterrows():
-
-        events.append({
-            "id": row["id"],
-            "title": row["title"],
-            "start": row["start"],
-            "end": row["end"],
-            "backgroundColor": row["colour"]
-        })
-
-    return events
-
-
-# ==================================================
-# FILE PARSERS
-# ==================================================
-
-def parse_campey(file):
-
-    events = []
-
-    try:
-
-        xls = pd.ExcelFile(file)
-
-        for sheet in xls.sheet_names:
-
-            df = pd.read_excel(
-                xls,
-                sheet_name=sheet
-            )
-
-            for _, row in df.iterrows():
-
-                row_data = [
-                    str(x)
-                    for x in row.tolist()
-                    if pd.notna(x)
-                ]
-
-                if not row_data:
-                    continue
-
-                title = (
-                    "Campey - " +
-                    " ".join(row_data[:3])
-                )
-
-                start = datetime.now()
-
-                events.append({
-                    "id": str(uuid.uuid4()),
-                    "title": title[:100],
-                    "start": start.isoformat(),
-                    "end": (
-  
+if len(txt.strip()) &lt; 10:
