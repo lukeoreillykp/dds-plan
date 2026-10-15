@@ -12,9 +12,9 @@ import streamlit as st
 from streamlit_calendar import calendar
 
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+# --------------------------------------------------
+# Configuration
+# --------------------------------------------------
 
 st.set_page_config(
     page_title="Operations Planner",
@@ -31,31 +31,66 @@ COLOURS = {
 }
 
 DATE_NAMES = (
-    "date", "start date", "delivery date", "collection date",
-    "appointment date", "scheduled date", "job date",
+    "date",
+    "start date",
+    "delivery date",
+    "collection date",
+    "appointment date",
+    "scheduled date",
+    "job date",
 )
 
 START_NAMES = (
-    "start", "start datetime", "start date time",
-    "appointment", "scheduled start", "begin",
+    "start",
+    "start datetime",
+    "start date time",
+    "appointment",
+    "scheduled start",
+    "begin",
 )
 
-TIME_NAMES = ("time", "start time", "arrival time", "collection time")
+TIME_NAMES = (
+    "time",
+    "start time",
+    "arrival time",
+    "collection time",
+)
 
-END_NAMES = ("end", "end datetime", "finish", "end time", "finish time")
+END_NAMES = (
+    "end",
+    "end datetime",
+    "finish",
+    "end time",
+    "finish time",
+)
 
-DURATION_NAMES = ("duration", "hours", "duration hours", "length")
+DURATION_NAMES = (
+    "duration",
+    "hours",
+    "duration hours",
+    "length",
+)
 
 TITLE_NAMES = (
-    "title", "event", "description", "job", "job name",
-    "customer", "customer name", "site", "site name",
-    "order", "order number", "reference", "vehicle",
+    "title",
+    "event",
+    "description",
+    "job",
+    "job name",
+    "customer",
+    "customer name",
+    "site",
+    "site name",
+    "order",
+    "order number",
+    "reference",
+    "vehicle",
 )
 
 
-# ============================================================
-# DATABASE
-# ============================================================
+# --------------------------------------------------
+# Database
+# --------------------------------------------------
 
 def connect_db():
     conn = sqlite3.connect(DB, timeout=30)
@@ -71,8 +106,8 @@ def init_db():
                 title TEXT NOT NULL,
                 start TEXT NOT NULL,
                 end TEXT NOT NULL,
-                colour TEXT NOT NULL,
-                source TEXT NOT NULL
+                colour TEXT,
+                source TEXT NOT NULL DEFAULT 'Manual'
             )
         """)
 
@@ -83,7 +118,7 @@ def init_db():
             )
         """)
 
-        # Migrate databases created by the original app.
+        # Migrate an existing database created by the older app.
         columns = {
             row[1]
             for row in conn.execute(
@@ -105,48 +140,63 @@ def get_events():
             ORDER BY start
         """).fetchall()
 
-    return [
-        {
-            "id": row[0],
-            "title": row[1],
-            "start": row[2],
-            "end": row[3],
-            "backgroundColor": row[4],
-            "extendedProps": {"source": row[5]},
-        }
-        for row in rows
-    ]
+    events = []
+
+    for event_id, title, start, end, colour, source in rows:
+        events.append({
+            "id": event_id,
+            "title": title,
+            "start": start,
+            "end": end,
+            "backgroundColor": colour or "#3498db",
+            "borderColor": colour or "#3498db",
+            "extendedProps": {
+                "source": source,
+            },
+        })
+
+    return events
 
 
-def add_event(event):
+def add_event(title, start, end, colour, source="Manual"):
+    event_id = str(uuid.uuid4())
+
     with connect_db() as conn:
         conn.execute("""
-            INSERT INTO events (id, title, start, end, colour, source)
+            INSERT INTO events
+                (id, title, start, end, colour, source)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (
-            event["id"],
-            event["title"],
-            event["start"],
-            event["end"],
-            event["backgroundColor"],
-            event["source"],
+            event_id,
+            title,
+            start.isoformat(),
+            end.isoformat(),
+            colour,
+            source,
         ))
+
+    return event_id
 
 
 def update_event(event_id, start, end):
     with connect_db() as conn:
-        cursor = conn.execute("""
+        conn.execute("""
             UPDATE events
             SET start = ?, end = ?
             WHERE id = ?
-        """, (start, end, event_id))
-
-        return cursor.rowcount > 0
+        """, (
+            start.isoformat(),
+            end.isoformat(),
+            str(event_id),
+        ))
 
 
 def delete_event(event_id):
     with connect_db() as conn:
-        conn.execute("DELETE FROM events WHERE id = ?", (event_id,))
+        conn.execute(
+            "DELETE FROM events WHERE id = ?",
+            (str(event_id),),
+        )
 
 
 def clear_calendar():
@@ -157,60 +207,70 @@ def clear_calendar():
 
 def imported_hash(content_hash):
     with connect_db() as conn:
-        return conn.execute(
-            "SELECT 1 FROM imported_files WHERE content_hash = ? LIMIT 1",
-            (content_hash,),
-        ).fetchone() is not None
+        row = conn.execute("""
+            SELECT filename
+            FROM imported_files
+            WHERE content_hash = ?
+        """, (content_hash,)).fetchone()
+
+    return row is not None
 
 
 def save_import(filename, content_hash, events):
-    """Save an import atomically; never mark a failed import as complete."""
     with connect_db() as conn:
-        conn.executemany("""
-            INSERT INTO events (id, title, start, end, colour, source)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, [
-            (
-                event["id"],
+        for event in events:
+            conn.execute("""
+                INSERT INTO events
+                    (id, title, start, end, colour, source)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                str(uuid.uuid4()),
                 event["title"],
-                event["start"],
-                event["end"],
-                event["backgroundColor"],
+                event["start"].isoformat(),
+                event["end"].isoformat(),
+                event["colour"],
                 event["source"],
-            )
-            for event in events
-        ])
+            ))
 
         conn.execute("""
             INSERT INTO imported_files (filename, content_hash)
             VALUES (?, ?)
-            ON CONFLICT(filename) DO UPDATE SET
-                content_hash = excluded.content_hash
+            ON CONFLICT(filename)
+            DO UPDATE SET content_hash = excluded.content_hash
         """, (filename, content_hash))
 
 
-# ============================================================
-# EXCEL IMPORT
-# ============================================================
+# --------------------------------------------------
+# Excel parsing helpers
+# --------------------------------------------------
 
 def normalise(value):
-    value = str(value).strip().lower()
-    return re.sub(r"[^a-z0-9]+", " ", value).strip()
+    text = str(value).strip().lower()
+    text = re.sub(r"[_\-]+", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text
 
 
 def find_column(columns, candidates, contains=False):
-    """Find a likely column name without assuming a fixed workbook layout."""
-    normalised = {column: normalise(column) for column in columns}
+    normalised = {
+        column: normalise(column)
+        for column in columns
+    }
 
+    # Prefer exact matches.
     for candidate in candidates:
+        candidate = normalise(candidate)
+
         for column, name in normalised.items():
             if name == candidate:
                 return column
 
     if contains:
         for candidate in candidates:
+            candidate = normalise(candidate)
+
             for column, name in normalised.items():
-                if candidate in name.split():
+                if candidate in name:
                     return column
 
     return None
@@ -219,10 +279,14 @@ def find_column(columns, candidates, contains=False):
 def valid_value(value):
     if value is None:
         return False
+
     try:
-        return not pd.isna(value) and str(value).strip() != ""
+        if pd.isna(value):
+            return False
     except (TypeError, ValueError):
-        return False
+        pass
+
+    return str(value).strip() != ""
 
 
 def parse_datetime(value):
@@ -231,20 +295,18 @@ def parse_datetime(value):
 
     try:
         result = pd.to_datetime(value, errors="coerce")
-        if pd.isna(result):
-            return None
-
-        result = result.to_pydatetime() if hasattr(
-            result, "to_pydatetime"
-        ) else result
-
-        # Keep stored calendar values consistent and timezone-naive.
-        if result.tzinfo is not None:
-            result = result.astimezone().replace(tzinfo=None)
-
-        return result
-    except (TypeError, ValueError, OverflowError):
+    except (ValueError, TypeError, OverflowError):
         return None
+
+    if pd.isna(result):
+        return None
+
+    result = result.to_pydatetime()
+
+    if result.tzinfo is not None:
+        result = result.astimezone().replace(tzinfo=None)
+
+    return result
 
 
 def parse_time(value):
@@ -254,422 +316,547 @@ def parse_time(value):
     if isinstance(value, time):
         return value.replace(tzinfo=None)
 
-    if isinstance(value, (datetime, pd.Timestamp)):
+    if isinstance(value, datetime):
         return value.time().replace(tzinfo=None)
 
-    # Excel can represent a time as a fraction of one day.
     if isinstance(value, (int, float)) and 0 <= value < 1:
-        seconds = round(value * 24 * 60 * 60)
+        seconds = int(round(value * 24 * 60 * 60))
         seconds %= 24 * 60 * 60
         return (
             datetime.min + timedelta(seconds=seconds)
         ).time()
 
-    parsed = pd.to_datetime(str(value), errors="coerce")
-    if pd.isna(parsed):
-        return None
+    parsed = parse_datetime(value)
 
-    return parsed.to_pydatetime().time()
+    if parsed is not None:
+        return parsed.time()
+
+    return None
 
 
 def parse_workbook(content, filename):
-    """
-    Detect common date/time and title columns.
+    source = (
+        "Campey"
+        if "campey" in filename.lower()
+        else "Bulk"
+    )
 
-    Returns (events, errors). Workbooks with no recognisable schedule
-    date are rejected instead of assigning a fabricated date.
-    """
-    events = []
+    colour = COLOURS[source]
+    workbook = pd.ExcelFile(BytesIO(content))
+
+    parsed_events = []
     errors = []
 
-    source = "Campey" if "campey" in filename.lower() else "Bulk"
-    colour = COLOURS[source]
-
-    try:
-        workbook = pd.ExcelFile(BytesIO(content))
-    except Exception as exc:
-        return [], [f"Could not open workbook: {exc}"]
-
-    for sheet in workbook.sheet_names:
+    for sheet_name in workbook.sheet_names:
         try:
-            df = pd.read_excel(workbook, sheet_name=sheet)
+            df = pd.read_excel(
+                workbook,
+                sheet_name=sheet_name,
+            )
         except Exception as exc:
-            errors.append(f"{sheet}: could not read sheet ({exc})")
+            errors.append(
+                f"{sheet_name}: couldn't read sheet ({exc})"
+            )
             continue
 
-        if df.empty or len(df.columns) == 0:
-            continue
-
-        # Remove completely blank rows and columns.
-        df = df.dropna(how="all").dropna(axis=1, how="all")
         if df.empty:
             continue
 
-        columns = list(df.columns)
+        df.columns = [
+            str(column).strip()
+            for column in df.columns
+        ]
 
-        start_col = find_column(columns, START_NAMES)
-        date_col = find_column(columns, DATE_NAMES)
-        time_col = find_column(columns, TIME_NAMES)
-        end_col = find_column(columns, END_NAMES)
-        duration_col = find_column(columns, DURATION_NAMES)
-        title_col = find_column(columns, TITLE_NAMES, contains=True)
+        # Detect the date/start column.
+        start_col = find_column(
+            df.columns,
+            START_NAMES,
+            contains=True,
+        )
 
-        # A combined start date/time column takes precedence.
-        if start_col is None and date_col is None:
+        date_col = find_column(
+            df.columns,
+            DATE_NAMES,
+            contains=True,
+        )
+
+        time_col = find_column(
+            df.columns,
+            TIME_NAMES,
+            contains=True,
+        )
+
+        end_col = find_column(
+            df.columns,
+            END_NAMES,
+            contains=True,
+        )
+
+        duration_col = find_column(
+            df.columns,
+            DURATION_NAMES,
+            contains=True,
+        )
+
+        title_col = find_column(
+            df.columns,
+            TITLE_NAMES,
+            contains=True,
+        )
+
+        # Prefer a combined start/date-time column.
+        if start_col is None:
+            start_col = date_col
+
+        if start_col is None:
             errors.append(
-                f"{sheet}: no recognised start/date column. "
-                f"Available columns: {', '.join(map(str, columns))}"
+                f"{sheet_name}: no recognised date/start column. "
+                "Check the spreadsheet headers."
             )
             continue
 
-        sheet_count = 0
+        sheet_events = 0
 
         for _, row in df.iterrows():
-            start = None
+            start_dt = parse_datetime(row.get(start_col))
 
-            if start_col is not None:
-                start = parse_datetime(row[start_col])
-
-            if start is None and date_col is not None:
-                day = parse_datetime(row[date_col])
-
-                if day is not None:
-                    clock = (
-                        parse_time(row[time_col])
-                        if time_col is not None
-                        else None
-                    )
-                    start = datetime.combine(
-                        day.date(),
-                        clock or time(9, 0),
-                    )
-
-            if start is None:
+            if start_dt is None:
                 continue
 
-            end = None
+            # If date and time are separate, combine them.
+            if (
+                date_col is not None
+                and time_col is not None
+                and date_col != start_col
+            ):
+                parsed_time = parse_time(row.get(time_col))
 
-            if end_col is not None:
-                end_value = row[end_col]
+                if parsed_time is not None:
+                    start_dt = datetime.combine(
+                        start_dt.date(),
+                        parsed_time,
+                    )
 
-                # An end column may contain a full date/time or only a time.
-                end = parse_datetime(end_value)
+            # Determine event end.
+            end_dt = None
 
-                if end is None:
-                    clock = parse_time(end_value)
-                    if clock is not None:
-                        end = datetime.combine(start.date(), clock)
-                        if end <= start:
-                            end += timedelta(days=1)
+            if (
+                end_col is not None
+                and valid_value(row.get(end_col))
+            ):
+                end_value = row.get(end_col)
 
-            if end is None and duration_col is not None:
+                # An end-time-only column uses the start date.
+                parsed_end_time = parse_time(end_value)
+
+                if (
+                    isinstance(end_value, time)
+                    or (
+                        isinstance(end_value, (int, float))
+                        and 0 <= end_value < 1
+                    )
+                ):
+                    if parsed_end_time is not None:
+                        end_dt = datetime.combine(
+                            start_dt.date(),
+                            parsed_end_time,
+                        )
+                else:
+                    end_dt = parse_datetime(end_value)
+
+                    # If parsing gives a time on a different date,
+                    # treat it as a time-only end when appropriate.
+                    if (
+                        end_dt is not None
+                        and end_dt.date() != start_dt.date()
+                        and parsed_end_time is not None
+                    ):
+                        end_dt = datetime.combine(
+                            start_dt.date(),
+                            parsed_end_time,
+                        )
+
+            elif (
+                duration_col is not None
+                and valid_value(row.get(duration_col))
+            ):
                 try:
-                    hours = float(row[duration_col])
-                    if 0 < hours <= 168:
-                        end = start + timedelta(hours=hours)
-                except (TypeError, ValueError):
-                    pass
+                    hours = float(row.get(duration_col))
+                    if hours > 0:
+                        end_dt = start_dt + timedelta(hours=hours)
+                except (ValueError, TypeError, OverflowError):
+                    end_dt = None
 
-            if end is None:
-                end = start + timedelta(hours=1)
+            # Default duration: 1 hour.
+            if end_dt is None or end_dt <= start_dt:
+                end_dt = start_dt + timedelta(hours=1)
 
-            if end <= start:
-                errors.append(
-                    f"{sheet}: skipped row with end before start."
-                )
-                continue
-
+            # Choose a useful title.
             title = None
-            if title_col is not None and valid_value(row[title_col]):
-                title = str(row[title_col]).strip()
+
+            if (
+                title_col is not None
+                and valid_value(row.get(title_col))
+            ):
+                title = str(row.get(title_col)).strip()
 
             if not title:
-                # Fallback to useful row data, not pandas' "nan" text.
-                parts = [
-                    str(value).strip()
-                    for value in row.tolist()
-                    if valid_value(value)
-                ]
-                title = " - ".join(parts[:3])[:100]
+                values = []
+
+                for value in row.tolist():
+                    if valid_value(value):
+                        values.append(str(value).strip())
+
+                title = " - ".join(values[:3])
 
             if not title:
-                continue
+                title = f"{source} event"
 
-            events.append({
-                "id": str(uuid.uuid4()),
-                "title": title,
-                "start": start.isoformat(),
-                "end": end.isoformat(),
-                "backgroundColor": colour,
+            parsed_events.append({
+                "title": title[:200],
+                "start": start_dt,
+                "end": end_dt,
+                "colour": colour,
                 "source": source,
             })
-            sheet_count += 1
 
-        if sheet_count == 0:
-            errors.append(f"{sheet}: no valid scheduled events found.")
+            sheet_events += 1
 
-    return events, errors
+        if sheet_events == 0:
+            errors.append(
+                f"{sheet_name}: no valid events found."
+            )
+
+    return parsed_events, errors
 
 
-# ============================================================
-# APP STARTUP
-# ============================================================
+# --------------------------------------------------
+# Initialise app
+# --------------------------------------------------
 
 init_db()
 
-st.title("📅 Operations Planning Calendar")
-st.caption("Import schedules, plan operations and manage events.")
-
-# ============================================================
-# SIDEBAR: IMPORT
-# ============================================================
-
-st.sidebar.header("Import schedules")
-
-files = st.sidebar.file_uploader(
-    "Upload Excel schedules",
-    type=["xlsx"],
-    accept_multiple_files=True,
-    key="schedule_upload",
+st.title("📅 Operations Planner")
+st.caption(
+    "Plan, import and manage your scheduled work in one calendar."
 )
 
-if files:
-    for uploaded in files:
-        content = uploaded.getvalue()
-        digest = sha256(content).hexdigest()
 
-        if imported_hash(digest):
-            st.sidebar.info(f"Already imported: {uploaded.name}")
-            continue
+# --------------------------------------------------
+# Sidebar: import schedules
+# --------------------------------------------------
 
-        with st.spinner(f"Reading {uploaded.name}..."):
-            parsed_events, errors = parse_workbook(
-                content, uploaded.name
-            )
+with st.sidebar:
+    st.header("Import schedules")
 
-        for error in errors:
-            st.warning(f"{uploaded.name}: {error}")
-
-        if not parsed_events:
-            st.sidebar.error(
-                f"No valid events imported from {uploaded.name}."
-            )
-            continue
-
-        try:
-            save_import(uploaded.name, digest, parsed_events)
-            st.sidebar.success(
-                f"{uploaded.name}: imported {len(parsed_events)} events."
-            )
-        except sqlite3.Error as exc:
-            st.sidebar.error(f"Database import failed: {exc}")
-
-# ============================================================
-# SIDEBAR: MANUAL EVENT
-# ============================================================
-
-st.sidebar.divider()
-st.sidebar.header("Add event")
-
-with st.sidebar.form("add_event_form", clear_on_submit=True):
-    title = st.text_input("Event title")
-    event_date = st.date_input("Date", value=date.today())
-    start_time = st.time_input("Start time", value=time(9, 0))
-    duration = st.number_input(
-        "Duration (hours)",
-        min_value=0.25,
-        max_value=168.0,
-        value=1.0,
-        step=0.25,
-    )
-    colour = st.color_picker("Event colour", COLOURS["Manual"])
-
-    submitted = st.form_submit_button(
-        "Add event",
-        type="primary",
-        use_container_width=True,
+    uploaded_files = st.file_uploader(
+        "Upload Excel schedules",
+        type=["xlsx", "xlsm", "xls"],
+        accept_multiple_files=True,
     )
 
-if submitted:
-    if not title.strip():
-        st.sidebar.error("Enter an event title.")
-    else:
-        start = datetime.combine(event_date, start_time)
-        end = start + timedelta(hours=float(duration))
+    if uploaded_files:
+        for uploaded_file in uploaded_files:
+            content = uploaded_file.getvalue()
+            content_hash = sha256(content).hexdigest()
 
-        try:
-            add_event({
-                "id": str(uuid.uuid4()),
-                "title": title.strip(),
-                "start": start.isoformat(),
-                "end": end.isoformat(),
-                "backgroundColor": colour,
-                "source": "Manual",
-            })
-            st.sidebar.success("Event added.")
-            st.rerun()
-        except sqlite3.Error as exc:
-            st.sidebar.error(f"Could not save event: {exc}")
+            if imported_hash(content_hash):
+                st.info(
+                    f"Already imported: {uploaded_file.name}"
+                )
+                continue
 
-# ============================================================
-# LOAD AND FILTER EVENTS
-# ============================================================
+            with st.spinner(
+                f"Importing {uploaded_file.name}..."
+            ):
+                try:
+                    events, errors = parse_workbook(
+                        content,
+                        uploaded_file.name,
+                    )
 
-try:
-    events = get_events()
-except sqlite3.Error as exc:
-    st.error(f"Could not load events: {exc}")
-    st.stop()
+                    if events:
+                        save_import(
+                            uploaded_file.name,
+                            content_hash,
+                            events,
+                        )
 
-total = len(events)
-manual_count = sum(
-    event["extendedProps"]["source"] == "Manual"
-    for event in events
+                        st.success(
+                            f"Imported {len(events)} events "
+                            f"from {uploaded_file.name}."
+                        )
+                    else:
+                        st.warning(
+                            f"No events imported from "
+                            f"{uploaded_file.name}."
+                        )
+
+                    for error in errors:
+                        st.warning(error)
+
+                except Exception as exc:
+                    st.error(
+                        f"Could not import "
+                        f"{uploaded_file.name}: {exc}"
+                    )
+
+    st.divider()
+
+    st.header("Add an event")
+
+    with st.form("manual_event_form", clear_on_submit=True):
+        event_title = st.text_input("Event title")
+
+        event_date = st.date_input(
+            "Date",
+            value=date.today(),
+        )
+
+        event_start_time = st.time_input(
+            "Start time",
+            value=time(9, 0),
+        )
+
+        event_duration = st.number_input(
+            "Duration (hours)",
+            min_value=0.25,
+            max_value=168.0,
+            value=1.0,
+            step=0.25,
+        )
+
+        event_colour = st.selectbox(
+            "Colour",
+            options=list(COLOURS.keys()),
+            index=2,
+        )
+
+        submitted = st.form_submit_button(
+            "Add event",
+            use_container_width=True,
+        )
+
+        if submitted:
+            if not event_title.strip():
+                st.error("Please enter an event title.")
+            else:
+                start_dt = datetime.combine(
+                    event_date,
+                    event_start_time,
+                )
+                end_dt = start_dt + timedelta(
+                    hours=float(event_duration)
+                )
+
+                add_event(
+                    event_title.strip(),
+                    start_dt,
+                    end_dt,
+                    COLOURS[event_colour],
+                    source="Manual",
+                )
+
+                st.success("Event added.")
+                st.rerun()
+
+
+# --------------------------------------------------
+# Load and filter events
+# --------------------------------------------------
+
+all_events = get_events()
+
+col1, col2, col3 = st.columns(3)
+
+col1.metric("Total events", len(all_events))
+
+col2.metric(
+    "Imported events",
+    sum(
+        1 for event in all_events
+        if event["extendedProps"]["source"] != "Manual"
+    ),
 )
-imported_count = total - manual_count
 
-metric1, metric2, metric3 = st.columns(3)
-metric1.metric("Total events", total)
-metric2.metric("Manual events", manual_count)
-metric3.metric("Imported events", imported_count)
-
-search = st.text_input(
-    "Search events",
-    placeholder="Search by title...",
+col3.metric(
+    "Manual events",
+    sum(
+        1 for event in all_events
+        if event["extendedProps"]["source"] == "Manual"
+    ),
 )
 
-source_filter = st.selectbox(
-    "Filter by source",
-    ["All", "Campey", "Bulk", "Manual"],
-)
+filter_col1, filter_col2 = st.columns([2, 1])
 
-visible_events = [
-    event for event in events
-    if search.strip().lower() in event["title"].lower()
-    and (
-        source_filter == "All"
-        or event["extendedProps"]["source"] == source_filter
+with filter_col1:
+    search_text = st.text_input(
+        "Search events",
+        placeholder="Search by title...",
     )
-]
 
-# ============================================================
-# CALENDAR
-# ============================================================
+with filter_col2:
+    source_filter = st.selectbox(
+        "Show source",
+        ["All", "Campey", "Bulk", "Manual"],
+    )
 
-st.subheader("Planning calendar")
+events = []
+
+for event in all_events:
+    source = event["extendedProps"]["source"]
+
+    if (
+        source_filter != "All"
+        and source != source_filter
+    ):
+        continue
+
+    if (
+        search_text.strip()
+        and search_text.lower() not in event["title"].lower()
+    ):
+        continue
+
+    events.append(event)
+
+
+# --------------------------------------------------
+# Calendar
+# --------------------------------------------------
+
+st.subheader("Schedule calendar")
+
+st.caption(
+    "Drag an event to reschedule it. "
+    "Use the buttons above the calendar to change views."
+)
 
 calendar_options = {
-    "editable": True,
-    "selectable": True,
+    "initialView": "dayGridMonth",
     "headerToolbar": {
         "left": "prev,next today",
         "center": "title",
-        "right": "timeGridWeek,timeGridDay,dayGridMonth",
+        "right": "dayGridMonth,timeGridWeek,timeGridDay",
     },
+    "height": 700,
+    "contentHeight": 650,
+    "editable": True,
+    "selectable": True,
+    "nowIndicator": True,
     "slotMinTime": "06:00:00",
     "slotMaxTime": "30:00:00",
-    "initialView": "timeGridWeek",
-    "allDaySlot": False,
-    "height": 750,
-    "nowIndicator": True,
+    "dayMaxEvents": True,
+    "navLinks": True,
 }
 
 calendar_state = calendar(
-    events=visible_events,
+    events=events,
     options=calendar_options,
+    custom_css="""
+        .fc {
+            min-height: 650px;
+        }
+
+        .fc .fc-toolbar-title {
+            font-size: 1.2rem;
+        }
+    """,
     callbacks=["eventChange"],
     key="operations_calendar",
 )
 
-# Persist drag-and-drop and resize changes.
-if (
-    isinstance(calendar_state, dict)
-    and calendar_state.get("callback") == "eventChange"
-):
-    changed = calendar_state.get("eventChange", {}).get("event", {})
 
-    event_id = changed.get("id")
-    new_start = changed.get("start")
-    new_end = changed.get("end")
+# --------------------------------------------------
+# Persist drag-and-drop changes
+# --------------------------------------------------
 
-    if event_id and new_start:
-        parsed_start = parse_datetime(new_start)
-        parsed_end = parse_datetime(new_end) if new_end else None
+if isinstance(calendar_state, dict):
+    if calendar_state.get("callback") == "eventChange":
+        change_data = calendar_state.get("eventChange", {})
+        changed_event = change_data.get("event", {})
 
-        # FullCalendar may omit the end when the event has no explicit end.
-        if parsed_start is not None:
-            if parsed_end is None:
-                parsed_end = parsed_start + timedelta(hours=1)
+        event_id = changed_event.get("id")
+        new_start = parse_datetime(changed_event.get("start"))
+        new_end = parse_datetime(changed_event.get("end"))
 
-            if parsed_end > parsed_start:
-                try:
-                    if update_event(
-                        event_id,
-                        parsed_start.isoformat(),
-                        parsed_end.isoformat(),
-                    ):
-                        st.toast("Calendar change saved.")
-                        st.rerun()
-                    else:
-                        st.warning(
-                            "The changed event could not be found in the database."
-                        )
-                except sqlite3.Error as exc:
-                    st.error(f"Could not save calendar change: {exc}")
-            else:
-                st.error("The event end must be after its start.")
+        if event_id and new_start:
+            if new_end is None or new_end <= new_start:
+                new_end = new_start + timedelta(hours=1)
 
-# ============================================================
-# EVENT LIST AND DELETE
-# ============================================================
+            update_event(
+                event_id,
+                new_start,
+                new_end,
+            )
+
+            st.rerun()
+
+
+# --------------------------------------------------
+# Delete events
+# --------------------------------------------------
 
 st.divider()
 st.subheader("Manage events")
 
-if not visible_events:
-    st.info("No events match your filters.")
+if not all_events:
+    st.info(
+        "No events yet. Add one from the sidebar "
+        "or import an Excel schedule."
+    )
 else:
-    options = {
-        event["id"]: (
-            f'{event["title"]} — '
-            f'{event["start"][:16].replace("T", " ")} '
-            f'({event["extendedProps"]["source"]})'
-        )
-        for event in visible_events
-    }
+    event_options = {}
 
-    selected_id = st.selectbox(
-        "Select an event",
-        options=list(options),
-        format_func=lambda event_id: options[event_id],
+    for event in all_events:
+        start_dt = parse_datetime(event["start"])
+        display_start = (
+            start_dt.strftime("%d %b %Y %H:%M")
+            if start_dt
+            else event["start"]
+        )
+
+        source = event["extendedProps"]["source"]
+
+        label = (
+            f"{display_start} — {event['title']} "
+            f"({source})"
+        )
+
+        # Include ID so duplicate titles remain distinct.
+        event_options[label + f" [{event['id'][:8]}]"] = event["id"]
+
+    selected_label = st.selectbox(
+        "Choose an event to delete",
+        options=list(event_options.keys()),
     )
 
-    if st.button("Delete selected event", type="secondary"):
-        try:
-            delete_event(selected_id)
-            st.success("Event deleted.")
-            st.rerun()
-        except sqlite3.Error as exc:
-            st.error(f"Could not delete event: {exc}")
+    if st.button(
+        "Delete selected event",
+        type="secondary",
+    ):
+        delete_event(event_options[selected_label])
+        st.success("Event deleted.")
+        st.rerun()
 
-with st.expander("Clear the entire calendar"):
+
+# --------------------------------------------------
+# Clear calendar
+# --------------------------------------------------
+
+with st.expander("Advanced: clear the calendar"):
     st.warning(
-        "This permanently deletes all calendar events and import history. "
-        "It does not delete the original Excel files."
+        "This removes all events and import records from the database."
     )
 
     confirm_clear = st.checkbox(
-        "I understand that all calendar events will be deleted."
+        "I understand that this cannot be undone."
     )
 
     if st.button(
         "Clear all events",
         disabled=not confirm_clear,
-        type="primary",
     ):
-        try:
-            clear_calendar()
-            st.success("Calendar cleared.")
-            st.rerun()
-        except sqlite3.Error as exc:
-            st.error(f"Could not clear calendar: {exc}")
+        clear_calendar()
+        st.success("Calendar cleared.")
+        st.rerun()
