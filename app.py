@@ -49,30 +49,11 @@ SOURCE_LABELS = {
 
 
 # ============================================================
-# SUPABASE
+# GENERAL HELPERS
 # ============================================================
 
-@st.cache_resource
-def get_supabase():
-    url = st.secrets.get("SUPABASE_URL")
-    key = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY")
-
-    if not url or not key:
-        st.error(
-            "Supabase credentials are missing. Add SUPABASE_URL and "
-            "SUPABASE_SERVICE_ROLE_KEY under Streamlit Cloud → "
-            "App settings → Secrets."
-        )
-        st.stop()
-
-    return create_client(url, key)
-
-
-supabase = get_supabase()
-
-
 def local_datetime(value):
-    if not value:
+    if value is None or value == "":
         return None
 
     try:
@@ -93,41 +74,102 @@ def local_datetime(value):
 
 
 def parse_date(value):
-    if value is None or pd.isna(value):
+    if value is None:
         return None
 
     try:
-        result = pd.to_datetime(value, dayfirst=True, errors="coerce")
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        # Excel date cells are often already datetime objects.
+        if isinstance(value, (datetime, date, pd.Timestamp)):
+            return pd.Timestamp(value).date()
+
+        result = pd.to_datetime(
+            value,
+            dayfirst=True,
+            errors="coerce",
+        )
+
         return None if pd.isna(result) else result.date()
+
     except Exception:
         return None
 
 
 def parse_time(value):
-    if value is None or pd.isna(value):
+    """
+    Supports:
+      Excel numeric times such as 0.5 = 12:00
+      Whole-hour cells such as 7, 8, 13
+      Decimal-style cells such as 13.3 = 13:30
+      Text times such as 08:30 or 13:30
+    """
+    if value is None:
         return None
+
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
 
     if isinstance(value, time):
         return value.replace(tzinfo=None)
 
-    if isinstance(value, datetime):
+    if isinstance(value, (datetime, pd.Timestamp)):
         return value.time().replace(tzinfo=None)
 
-    # Excel time stored as a fraction of a day.
+    # Handle numeric Excel values and numbers read from cells.
     try:
         number = float(value)
 
         if 0 <= number < 1:
             seconds = round(number * 86400)
             return (datetime.min + timedelta(seconds=seconds)).time()
-    except (ValueError, TypeError):
+
+        if 0 <= number < 24:
+            # Whole number means an exact hour.
+            if number.is_integer():
+                return time(int(number), 0)
+
+            # In this workbook, 14.3 represents 14:30, not 14:18.
+            text = str(value).strip()
+            whole, decimal = text.split(".", 1)
+
+            hour = int(whole)
+
+            if len(decimal) == 1:
+                minute = int(decimal) * 10
+            else:
+                minute = int(decimal[:2].ljust(2, "0"))
+
+            if 0 <= hour < 24 and 0 <= minute < 60:
+                return time(hour, minute)
+
+    except (ValueError, TypeError, OverflowError):
         pass
 
+    # Handle ordinary strings such as "08:30".
     try:
-        result = pd.to_datetime(str(value).strip(), errors="coerce")
+        text = str(value).strip()
+
+        match = re.fullmatch(r"(\d{1,2})[:.](\d{2})", text)
+        if match:
+            hour = int(match.group(1))
+            minute = int(match.group(2))
+
+            if 0 <= hour < 24 and 0 <= minute < 60:
+                return time(hour, minute)
+
+        result = pd.to_datetime(text, errors="coerce")
 
         if not pd.isna(result):
             return result.to_pydatetime().time().replace(tzinfo=None)
+
     except Exception:
         pass
 
@@ -135,13 +177,42 @@ def parse_time(value):
 
 
 def clean_cell(value):
-    if value is None or pd.isna(value):
+    if value is None:
         return ""
+
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
 
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
 
     return str(value).strip()
+
+
+# ============================================================
+# SUPABASE
+# ============================================================
+
+@st.cache_resource
+def get_supabase():
+    url = st.secrets.get("SUPABASE_URL")
+    key = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY")
+
+    if not url or not key:
+        st.error(
+            "Supabase credentials are missing. Add SUPABASE_URL and "
+            "SUPABASE_SERVICE_ROLE_KEY under Streamlit Cloud → "
+            "App settings → Secrets."
+        )
+        st.stop()
+
+    return create_client(url, key)
+
+
+supabase = get_supabase()
 
 
 def get_events():
@@ -168,6 +239,14 @@ def get_imported_hashes():
     }
 
 
+def remember_import(file_hash, filename):
+    supabase.table("imported_files").upsert({
+        "file_hash": file_hash,
+        "filename": filename,
+        "imported_at": datetime.now(UK).isoformat(),
+    }).execute()
+
+
 def save_event(title, start_dt, end_dt, source, event_id=None):
     payload = {
         "title": title.strip(),
@@ -186,16 +265,8 @@ def save_event(title, start_dt, end_dt, source, event_id=None):
         supabase.table("events").insert(payload).execute()
 
 
-def remember_import(file_hash, filename):
-    supabase.table("imported_files").upsert({
-        "file_hash": file_hash,
-        "filename": filename,
-        "imported_at": datetime.now(UK).isoformat(),
-    }).execute()
-
-
 # ============================================================
-# CAMPEY WORKBOOK IMPORTER
+# CAMPEY WORKBOOK IMPORT
 # ============================================================
 
 def parse_campey_workbook(file_bytes):
@@ -305,18 +376,21 @@ def parse_campey_workbook(file_bytes):
 
 
 # ============================================================
-# BULK INBOUND WORKBOOK IMPORTER
-# Reads weekly sheets with weekday column groups:
-# time | supplier | product | order / quantity
+# BULK INBOUND WORKBOOK IMPORT
 # ============================================================
 
 def parse_bulk_workbook(file_bytes):
+    """
+    Read weekday groups from the Bulk Schedule workbook.
+
+    Each weekday normally uses four columns:
+    time | supplier | product/reference | quantity/details
+
+    The date is taken from row 0 of the second column in each group.
+    """
     workbook = pd.ExcelFile(io.BytesIO(file_bytes))
     bookings = {}
 
-    # The weekly tabs contain five weekday groups, normally four
-    # columns per group. The date is in the first row of each group,
-    # in the supplier/detail column immediately after the time column.
     for sheet_name in workbook.sheet_names:
         if sheet_name.strip().lower() in {"maris", "rejected"}:
             continue
@@ -330,7 +404,7 @@ def parse_bulk_workbook(file_bytes):
         if raw.empty or len(raw.index) < 4:
             continue
 
-        # Monday-Friday groups start at columns 0, 4, 8, 12 and 16.
+        # Monday-Friday column groups.
         for base_col in (0, 4, 8, 12, 16):
             date_col = base_col + 1
 
@@ -342,24 +416,24 @@ def parse_bulk_workbook(file_bytes):
             if booking_date is None:
                 continue
 
-            # Rows 0-2 contain dates, weekday names and summary headings.
+            # First rows contain dates, weekday names and summaries.
             for row_index in range(3, len(raw.index)):
                 if base_col >= raw.shape[1]:
                     continue
 
-                booking_time = parse_time(raw.iat[row_index, base_col])
+                booking_time = parse_time(
+                    raw.iat[row_index, base_col]
+                )
 
-                # Entries such as TBC or text instructions do not
-                # have a definite planned time, so they are skipped.
                 if booking_time is None:
                     continue
 
                 details = []
 
-                for col_index in range(base_col + 1, base_col + 4):
-                    if col_index >= raw.shape[1]:
-                        continue
-
+                for col_index in range(
+                    base_col + 1,
+                    min(base_col + 4, raw.shape[1]),
+                ):
                     text_value = clean_cell(
                         raw.iat[row_index, col_index]
                     )
@@ -373,34 +447,28 @@ def parse_bulk_workbook(file_bytes):
                 title = " · ".join(details)
                 title_lower = title.casefold()
 
-                # Avoid importing instruction-only cells as bookings.
+                # Ignore obvious instruction-only cells.
                 if any(
                     phrase in title_lower
                     for phrase in (
                         "no deliveries",
-                        "engagement day",
                         "bank holiday",
-                        "do not forget",
+                        "engagement day",
                     )
                 ):
                     continue
 
                 start_dt = datetime.combine(
-                    booking_date, booking_time
+                    booking_date,
+                    booking_time,
                 ).replace(tzinfo=UK)
 
-                key = (
-                    title.casefold(),
-                    start_dt.isoformat(),
-                )
+                key = (title.casefold(), start_dt.isoformat())
 
                 bookings[key] = {
                     "title": title,
                     "start": start_dt,
                     "end": start_dt + timedelta(hours=1),
-                    # The existing Supabase source constraint permits
-                    # Campey, Bulk and Manual. Bulk is displayed as
-                    # "Bulk Inbound" throughout the app.
                     "source": "Bulk",
                     "colour": AMBER,
                 }
@@ -495,7 +563,7 @@ def get_sent_loads():
                 if not pd.isna(parsed):
                     sent_at = parsed.to_pydatetime()
 
-        # Fallback for filenames such as H43474_20261002_224101.csv.
+        # Filename fallback, e.g. H43474_20261002_224101.csv.
         if sent_at is None:
             match = re.search(
                 r"_(\d{8})_(\d{6})\.csv$",
@@ -531,12 +599,14 @@ def get_sent_loads():
 
 
 def decorate_events(events, sent_loads, now):
-    """Only Campey events receive green/red sent-load status."""
+    """Apply green/red behaviour to Campey events only."""
 
     loads_by_day = {}
 
     for load in sent_loads:
-        loads_by_day.setdefault(load["sent_at"].date(), []).append(load)
+        loads_by_day.setdefault(
+            load["sent_at"].date(), []
+        ).append(load)
 
     campey_by_day = {}
 
@@ -553,7 +623,7 @@ def decorate_events(events, sent_loads, now):
 
     decorated = []
 
-    # Match CSV loads to Campey bookings, one-to-one, by day.
+    # Match one sent load per Campey booking, in time order.
     for day, bookings in campey_by_day.items():
         bookings.sort(
             key=lambda pair: (
@@ -581,8 +651,7 @@ def decorate_events(events, sent_loads, now):
 
             decorated.append(item)
 
-    # Bulk Inbound and Manual events keep their own colours.
-    # They are never assigned green or red status.
+    # Bulk and Manual bookings keep their own colour and title.
     for event in events:
         if event.get("source", "Manual") == "Campey":
             continue
@@ -602,7 +671,9 @@ def decorate_events(events, sent_loads, now):
 
 
 # ============================================================
-# SHARED IMPORT HANDLER
+# IMPORT HANDLER
+# Allows a previously imported file to be re-scanned for missing
+# rows. Duplicate bookings are skipped by title, date, time, source.
 # ============================================================
 
 def import_bookings(parsed, file_hash, filename):
@@ -644,12 +715,10 @@ def import_bookings(parsed, file_hash, filename):
 
         existing_keys.add(key)
 
-    if rows_to_insert:
-        # Insert in batches to avoid oversized requests.
-        for offset in range(0, len(rows_to_insert), 100):
-            supabase.table("events").insert(
-                rows_to_insert[offset:offset + 100]
-            ).execute()
+    for offset in range(0, len(rows_to_insert), 100):
+        supabase.table("events").insert(
+            rows_to_insert[offset:offset + 100]
+        ).execute()
 
     remember_import(file_hash, filename)
 
@@ -846,55 +915,57 @@ with st.expander("📥 Import Campey transport workbook"):
 
         try:
             already_imported = file_hash in get_imported_hashes()
-        except Exception as exc:
+        except Exception:
             already_imported = False
-            st.warning(f"Could not check import history: {exc}")
 
         if already_imported:
-            st.info("This exact workbook has already been imported.")
-        else:
-            try:
-                parsed = parse_campey_workbook(file_bytes)
-                st.write(f"Found **{len(parsed)}** Campey bookings.")
+            st.info(
+                "This workbook was imported previously. You can still "
+                "re-scan it to add any missing bookings."
+            )
 
-                if parsed:
-                    st.dataframe(
-                        pd.DataFrame([
-                            {
-                                "Date": row["start"].strftime("%d/%m/%Y"),
-                                "Planned time": row["start"].strftime("%H:%M"),
-                                "Del Site": row["title"],
-                            }
-                            for row in parsed
-                        ]),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
+        try:
+            parsed = parse_campey_workbook(file_bytes)
+            st.write(f"Found **{len(parsed)}** Campey bookings.")
 
-                    if st.button(
-                        "Import Campey bookings",
-                        type="primary",
-                        key="import_campey",
-                    ):
-                        try:
-                            count = import_bookings(
-                                parsed, file_hash, campey_file.name
-                            )
-                            st.success(
-                                f"Imported {count} new Campey bookings. "
-                                "Matching existing bookings were skipped."
-                            )
-                            st.rerun()
-                        except Exception as exc:
-                            st.error(f"Import failed: {exc}")
-                else:
-                    st.warning(
-                        "No bookings found. Check the Date, Planned Time "
-                        "and Del Site columns in the workbook."
-                    )
+            if parsed:
+                st.dataframe(
+                    pd.DataFrame([
+                        {
+                            "Date": row["start"].strftime("%d/%m/%Y"),
+                            "Planned time": row["start"].strftime("%H:%M"),
+                            "Del Site": row["title"],
+                        }
+                        for row in parsed
+                    ]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
-            except Exception as exc:
-                st.error(f"Could not read the Campey workbook: {exc}")
+                if st.button(
+                    "Import / re-scan Campey bookings",
+                    type="primary",
+                    key="import_campey",
+                ):
+                    try:
+                        count = import_bookings(
+                            parsed, file_hash, campey_file.name
+                        )
+                        st.success(
+                            f"Added {count} new Campey bookings. "
+                            "Existing matching bookings were skipped."
+                        )
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Import failed: {exc}")
+            else:
+                st.warning(
+                    "No bookings found. Check the Date, Planned Time "
+                    "and Del Site columns."
+                )
+
+        except Exception as exc:
+            st.error(f"Could not read the Campey workbook: {exc}")
 
 
 # ============================================================
@@ -903,8 +974,8 @@ with st.expander("📥 Import Campey transport workbook"):
 
 with st.expander("📦 Import Bulk Inbound schedule"):
     st.write(
-        "Upload the weekly Bulk Schedule workbook. Entries are imported "
-        "in amber and are not affected by Campey sent-load or overdue status."
+        "Upload the weekly Bulk Schedule workbook. Entries are amber "
+        "and do not use Campey sent-load or overdue behaviour."
     )
 
     bulk_file = st.file_uploader(
@@ -919,65 +990,64 @@ with st.expander("📦 Import Bulk Inbound schedule"):
 
         try:
             already_imported = bulk_hash in get_imported_hashes()
-        except Exception as exc:
+        except Exception:
             already_imported = False
-            st.warning(f"Could not check import history: {exc}")
 
         if already_imported:
-            st.info("This exact Bulk Schedule workbook has already been imported.")
-        else:
-            try:
-                parsed_bulk = parse_bulk_workbook(bulk_bytes)
+            st.info(
+                "This workbook was imported previously. You can still "
+                "re-scan it to add missing entries from the earlier attempt."
+            )
 
-                st.write(
-                    f"Found **{len(parsed_bulk)}** timed Bulk Inbound entries."
-                )
+        try:
+            parsed_bulk = parse_bulk_workbook(bulk_bytes)
 
-                if parsed_bulk:
-                    bulk_preview = pd.DataFrame([
+            st.write(
+                f"Found **{len(parsed_bulk)}** timed Bulk Inbound entries."
+            )
+
+            if parsed_bulk:
+                st.dataframe(
+                    pd.DataFrame([
                         {
                             "Date": row["start"].strftime("%d/%m/%Y"),
                             "Time": row["start"].strftime("%H:%M"),
                             "Bulk Inbound details": row["title"],
                         }
                         for row in parsed_bulk
-                    ])
+                    ]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
-                    st.dataframe(
-                        bulk_preview,
-                        use_container_width=True,
-                        hide_index=True,
-                    )
+                if st.button(
+                    "Import / re-scan Bulk Inbound bookings",
+                    type="primary",
+                    key="import_bulk",
+                ):
+                    try:
+                        count = import_bookings(
+                            parsed_bulk,
+                            bulk_hash,
+                            bulk_file.name,
+                        )
 
-                    if st.button(
-                        "Import Bulk Inbound bookings",
-                        type="primary",
-                        key="import_bulk",
-                    ):
-                        try:
-                            count = import_bookings(
-                                parsed_bulk,
-                                bulk_hash,
-                                bulk_file.name,
-                            )
+                        st.success(
+                            f"Added {count} new Bulk Inbound entries. "
+                            "Existing matching entries were skipped."
+                        )
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Bulk import failed: {exc}")
 
-                            st.success(
-                                f"Imported {count} new Bulk Inbound entries. "
-                                "Matching existing entries were skipped."
-                            )
-                            st.rerun()
+            else:
+                st.warning(
+                    "No timed entries found. Check the weekly tabs, dates, "
+                    "times and booking details in the workbook."
+                )
 
-                        except Exception as exc:
-                            st.error(f"Bulk import failed: {exc}")
-
-                else:
-                    st.warning(
-                        "No timed entries were found. Check that the workbook "
-                        "contains weekly tabs with dates, times and booking details."
-                    )
-
-            except Exception as exc:
-                st.error(f"Could not read the Bulk Schedule workbook: {exc}")
+        except Exception as exc:
+            st.error(f"Could not read the Bulk Schedule workbook: {exc}")
 
 
 # ============================================================
@@ -1000,8 +1070,7 @@ with st.expander("✏️ Edit or delete a booking"):
             if start_dt:
                 label = (
                     f"{start_dt:%d/%m/%Y %H:%M} — "
-                    f"{event.get('title', '(untitled)')} "
-                    f"[{source_label}]"
+                    f"{event.get('title', '(untitled)')} [{source_label}]"
                 )
             else:
                 label = event.get("title", "(untitled)")
@@ -1039,8 +1108,8 @@ with st.expander("✏️ Edit or delete a booking"):
             )
 
             ec3, ec4 = st.columns(2)
-
             source_options = ["Manual", "Campey", "Bulk Inbound"]
+
             current_source = selected.get("source", "Manual")
             current_label = SOURCE_LABELS.get(
                 current_source, current_source
@@ -1122,13 +1191,13 @@ with st.expander("✏️ Edit or delete a booking"):
 
 
 # ============================================================
-# SENT-LOAD DETAILS
+# CAMPEY SENT-LOAD DETAILS
 # ============================================================
 
 with st.expander("📄 Campey sent-load CSV details"):
     st.caption(
         f"Read-only source: {SENDER_REPO}/saved_loads. "
-        "The CSV list refreshes every 60 seconds."
+        "CSV data is cached for 60 seconds."
     )
 
     st.write(f"CSV loads found: **{len(sent_loads)}**")
@@ -1150,8 +1219,8 @@ with st.expander("📄 Campey sent-load CSV details"):
         )
 
     st.caption(
-        "Only Campey bookings are matched to sent-load CSVs. "
-        "Bulk Inbound bookings remain amber regardless of date."
+        "Only Campey bookings receive green sent or red overdue status. "
+        "Bulk Inbound bookings remain amber."
     )
 
 st.caption(
