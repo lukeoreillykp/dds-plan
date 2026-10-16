@@ -487,12 +487,63 @@ def parse_bulk_workbook(file_bytes):
 # DHL PONTEFRACT WORKBOOK IMPORT
 # ============================================================
 
+def parse_dhl_header_date(value):
+    """
+    Parse a week date from the worksheet header area.
+
+    Supports Excel date cells and text dates such as 7/5/2026,
+    interpreted as July 5, 2026 (month/day/year).
+
+    Ordinary numeric hour headings are not treated as dates.
+    """
+    if value is None:
+        return None
+
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+
+    if isinstance(value, (datetime, date, pd.Timestamp)):
+        return pd.Timestamp(value).date()
+
+    # Handle an Excel date serial if it wasn't decoded as a date.
+    if isinstance(value, (int, float)):
+        if 20000 <= value <= 80000:
+            try:
+                return (
+                    pd.Timestamp("1899-12-30")
+                    + pd.to_timedelta(value, unit="D")
+                ).date()
+        except (TypeError, ValueError, OverflowError):
+                return None
+        return None
+
+    text = clean_cell(value)
+
+    if not text:
+        return None
+
+    for fmt in (
+        "%m/%d/%Y",
+        "%m/%d/%y",
+        "%m-%d-%Y",
+        "%m-%d-%y",
+        "%Y-%m-%d",
+    ):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+
+    return None
+
+
 def get_week_start_from_sheet(sheet_name):
     """
-    Extract a week-commencing date from sheet names such as:
-    WC 140926, W.C. 140926, WC 14092026.
-
-    Returns None if the sheet name contains no recognised date.
+    Compatibility helper for worksheet names that contain a date.
+    The DHL parser uses the date in the worksheet header instead.
     """
     match = re.search(
         r"W\s*\.?\s*C\s*\.?\s*[-:]?\s*(\d{6}|\d{8})",
@@ -501,19 +552,17 @@ def get_week_start_from_sheet(sheet_name):
     )
 
     if not match:
-        # Also accept an unlabelled date in a sheet name if it
-        # looks like DDMMYY or DDMMYYYY.
-        match = re.search(r"(?<!\d)(\d{8}|\d{6})(?!\d)", sheet_name)
-
-    if not match:
         return None
 
     value = match.group(1)
 
-    for fmt in (
-        "%d%m%Y" if len(value) == 8 else "%d%m%y",
-        "%Y%m%d" if len(value) == 8 else "%y%m%d",
-    ):
+    formats = (
+        ("%d%m%Y", "%Y%m%d")
+        if len(value) == 8
+        else ("%d%m%y", "%y%m%d")
+    )
+
+    for fmt in formats:
         try:
             return datetime.strptime(value, fmt).date()
         except ValueError:
@@ -538,12 +587,14 @@ def is_one(value):
 
 def parse_dhl_workbook(file_bytes):
     """
-    Parse the Factory Movements workbook.
+    Parse every weekly worksheet in the Factory Movements workbook.
 
-    Only rows whose label starts with PONTEFRACT are considered.
-    Each hourly cell containing exactly 1 creates a DHL Collection.
-    Weekly totals and daily TOTAL columns are not imported.
-    Historical dates are included.
+    Each worksheet represents one week. Its week-start date is read
+    from the top-left five-by-five cell area.
+
+    Only PONTEFRACT rows are imported. Each hourly cell containing
+    exactly 1 creates a DHL Collection event. TOTAL columns are ignored.
+    Duplicate date/time slots are collapsed into one event.
     """
     workbook = pd.ExcelFile(io.BytesIO(file_bytes))
     bookings = {}
@@ -565,39 +616,42 @@ def parse_dhl_workbook(file_bytes):
             header=None,
         )
 
-        if raw.empty:
+        if raw.empty or raw.shape[1] < 2:
             continue
 
-        week_start = get_week_start_from_sheet(sheet_name)
+        # Read the week date from the top-left header area only.
+        # Do not use timestamps elsewhere in the worksheet.
+        week_start = None
 
-        # Each weekday header row defines the date and hourly columns.
+        for row_index in range(min(5, raw.shape[0])):
+            for col_index in range(min(5, raw.shape[1])):
+                candidate = parse_dhl_header_date(
+                    raw.iat[row_index, col_index]
+                )
+
+                if candidate is not None:
+                    week_start = candidate
+                    break
+
+            if week_start is not None:
+                break
+
+        if week_start is None:
+            continue
+
         for header_row in range(len(raw.index)):
-            first_cell = clean_cell(raw.iat[header_row, 0]).upper()
+            first_cell = clean_cell(
+                raw.iat[header_row, 0]
+            ).upper()
+
             day_key = first_cell[:3]
 
             if day_key not in weekday_offsets:
                 continue
 
-            if week_start is None:
-                # Fallback: try the date cell in the same header row.
-                header_date = None
-
-                for col in range(1, raw.shape[1]):
-                    header_date = parse_date(raw.iat[header_row, col])
-
-                    if header_date:
-                        break
-
-                if header_date is None:
-                    continue
-
-                # The date in the header row is the best available
-                # anchor if the sheet name doesn't include a week date.
-                collection_date = header_date
-            else:
-                collection_date = week_start + timedelta(
-                    days=weekday_offsets[day_key]
-                )
+            collection_date = week_start + timedelta(
+                days=weekday_offsets[day_key]
+            )
 
             hourly_columns = []
 
@@ -605,12 +659,10 @@ def parse_dhl_workbook(file_bytes):
                 heading = raw.iat[header_row, col]
                 heading_text = clean_cell(heading).upper()
 
-                # Explicitly ignore totals and date cells.
-                if (
-                    heading_text == "TOTAL"
-                    or "TOTAL" in heading_text
-                    or parse_date(heading) is not None
-                ):
+                if not heading_text or "TOTAL" in heading_text:
+                    continue
+
+                if parse_dhl_header_date(heading) is not None:
                     continue
 
                 parsed_time = parse_time(heading)
@@ -618,7 +670,6 @@ def parse_dhl_workbook(file_bytes):
                 if parsed_time is None:
                     continue
 
-                # A time heading identifies an hourly slot.
                 hourly_columns.append(
                     (col, time(parsed_time.hour, 0))
                 )
@@ -626,9 +677,14 @@ def parse_dhl_workbook(file_bytes):
             if not hourly_columns:
                 continue
 
-            # Scan rows until the next weekday header.
-            for row_index in range(header_row + 1, len(raw.index)):
-                row_label = clean_cell(raw.iat[row_index, 0]).upper()
+            # Read rows beneath this weekday until the next weekday.
+            for row_index in range(
+                header_row + 1,
+                len(raw.index),
+            ):
+                row_label = clean_cell(
+                    raw.iat[row_index, 0]
+                ).upper()
 
                 if row_label[:3] in weekday_offsets:
                     break
@@ -641,14 +697,17 @@ def parse_dhl_workbook(file_bytes):
                         continue
 
                     start_dt = datetime.combine(
-                        collection_date, hour
+                        collection_date,
+                        hour,
                     ).replace(tzinfo=UK)
 
                     title = "DHL Collection - Pontefract"
 
-                    # One event per date/hour. Repeated weekly sheets
-                    # or duplicate rows won't create duplicate slots.
-                    key = make_booking_key(title, start_dt, "DHL")
+                    key = make_booking_key(
+                        title,
+                        start_dt,
+                        "DHL",
+                    )
 
                     bookings[key] = {
                         "title": title,
@@ -1226,12 +1285,11 @@ with st.expander("📦 Import Bulk Inbound schedule"):
 # IMPORT DHL PONTEFRACT COLLECTIONS
 # ============================================================
 
-with st.expander("🚚 Import DHL collections — Pontefract only"):
+with st.expander("🚚 Bulk import DHL collections — Pontefract"):
     st.write(
-        "Historical and future dates are included. Each hourly cell "
-        "containing exactly 1 in a PONTEFRACT row creates one teal "
-        "DHL Collection event. Weekly totals and daily total columns "
-        "are ignored."
+        "Every worksheet is treated as one week. The week date is "
+        "read from the worksheet header. Only Pontefract collection "
+        "slots are imported. Review the weekly counts before importing."
     )
 
     dhl_file = st.file_uploader(
@@ -1245,7 +1303,9 @@ with st.expander("🚚 Import DHL collections — Pontefract only"):
         dhl_hash = hashlib.sha256(dhl_bytes).hexdigest()
 
         try:
-            already_imported = dhl_hash in get_imported_hashes()
+            already_imported = (
+                dhl_hash in get_imported_hashes()
+            )
         except Exception:
             already_imported = False
 
@@ -1258,47 +1318,70 @@ with st.expander("🚚 Import DHL collections — Pontefract only"):
         try:
             parsed_dhl = parse_dhl_workbook(dhl_bytes)
 
-            st.write(
-                f"Found **{len(parsed_dhl)}** DHL collection time slots."
-            )
-
             if parsed_dhl:
-                preview = pd.DataFrame([
+                # Group counts by Sunday-start calendar week.
+                weekly_counts = {}
+
+                for item in parsed_dhl:
+                    collection_date = item["start"].date()
+                    week_start = collection_date - timedelta(
+                        days=(collection_date.weekday() + 1) % 7
+                    )
+
+                    weekly_counts[week_start] = (
+                        weekly_counts.get(week_start, 0) + 1
+                    )
+
+                preview_rows = [
                     {
-                        "Date": item["start"].strftime("%d/%m/%Y"),
-                        "Time": item["start"].strftime("%H:%M"),
-                        "Collection": item["title"],
+                        "Week commencing": week_start.strftime("%d/%m/%Y"),
+                        "Collections found": count,
                     }
-                    for item in parsed_dhl
-                ])
+                    for week_start, count in sorted(
+                        weekly_counts.items()
+                    )
+                ]
+
+                st.write(
+                    f"**{len(parsed_dhl)} collection slots found "
+                    f"across {len(weekly_counts)} weeks.**"
+                )
 
                 st.dataframe(
-                    preview,
+                    pd.DataFrame(preview_rows),
                     use_container_width=True,
                     hide_index=True,
                 )
 
                 if st.button(
-                    "Import / re-scan DHL collections",
+                    "Bulk import / re-scan DHL collections",
                     type="primary",
                     key="import_dhl",
                 ):
                     try:
-                        count = import_bookings(
-                            parsed_dhl, dhl_hash, dhl_file.name
+                        added_count = import_bookings(
+                            parsed_dhl,
+                            dhl_hash,
+                            dhl_file.name,
                         )
+
+                        skipped_count = len(parsed_dhl) - added_count
+
                         st.success(
-                            f"Added {count} new DHL collection events. "
-                            "Existing matching events were skipped."
+                            f"Import complete: {added_count} added · "
+                            f"{skipped_count} already existed · "
+                            f"{len(weekly_counts)} weeks processed."
                         )
-                        st.rerun()
+
                     except Exception as exc:
                         st.error(f"DHL import failed: {exc}")
+
             else:
                 st.warning(
-                    "No DHL collection slots were found. Check the "
-                    "sheet names, weekday headings, time headings, and "
-                    "PONTEFRACT rows in the workbook."
+                    "No DHL collection slots were found. Check that "
+                    "each worksheet has its week date in the top-left "
+                    "header area, weekday headings, hourly columns, "
+                    "and PONTEFRACT rows."
                 )
 
         except Exception as exc:
