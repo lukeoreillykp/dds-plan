@@ -13,7 +13,7 @@ from supabase import create_client
 from streamlit_calendar import calendar
 
 # ============================================================
-# DDS TRANSPORT CALENDAR
+# CONFIGURATION
 # ============================================================
 
 st.set_page_config(
@@ -39,6 +39,12 @@ SOURCE_COLOURS = {
     "Campey": BLUE,
     "Bulk": AMBER,
     "Manual": PURPLE,
+}
+
+SOURCE_LABELS = {
+    "Campey": "Campey",
+    "Bulk": "Bulk Inbound",
+    "Manual": "Manual",
 }
 
 
@@ -107,7 +113,7 @@ def parse_time(value):
     if isinstance(value, datetime):
         return value.time().replace(tzinfo=None)
 
-    # Excel sometimes stores times as a fraction of one day.
+    # Excel time stored as a fraction of a day.
     try:
         number = float(value)
 
@@ -126,6 +132,16 @@ def parse_time(value):
         pass
 
     return None
+
+
+def clean_cell(value):
+    if value is None or pd.isna(value):
+        return ""
+
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+
+    return str(value).strip()
 
 
 def get_events():
@@ -152,13 +168,7 @@ def get_imported_hashes():
     }
 
 
-def save_event(
-    title,
-    start_dt,
-    end_dt,
-    source,
-    event_id=None,
-):
+def save_event(title, start_dt, end_dt, source, event_id=None):
     payload = {
         "title": title.strip(),
         "start": start_dt.astimezone(UK).isoformat(),
@@ -173,15 +183,22 @@ def save_event(
         ).execute()
     else:
         payload["id"] = str(uuid.uuid4())
-
         supabase.table("events").insert(payload).execute()
 
 
+def remember_import(file_hash, filename):
+    supabase.table("imported_files").upsert({
+        "file_hash": file_hash,
+        "filename": filename,
+        "imported_at": datetime.now(UK).isoformat(),
+    }).execute()
+
+
 # ============================================================
-# CAMPEY EXCEL IMPORT
+# CAMPEY WORKBOOK IMPORTER
 # ============================================================
 
-def parse_workbook(file_bytes):
+def parse_campey_workbook(file_bytes):
     workbook = pd.ExcelFile(io.BytesIO(file_bytes))
     bookings = {}
 
@@ -194,7 +211,6 @@ def parse_workbook(file_bytes):
 
         header_row = None
 
-        # Find the real headings; workbook tabs may have title rows first.
         for index, row in raw.iterrows():
             values = [
                 str(value).strip().lower()
@@ -289,8 +305,111 @@ def parse_workbook(file_bytes):
 
 
 # ============================================================
-# READ-ONLY SENT-LOAD CHECK
-# A CSV appearing in saved_loads means the load was sent.
+# BULK INBOUND WORKBOOK IMPORTER
+# Reads weekly sheets with weekday column groups:
+# time | supplier | product | order / quantity
+# ============================================================
+
+def parse_bulk_workbook(file_bytes):
+    workbook = pd.ExcelFile(io.BytesIO(file_bytes))
+    bookings = {}
+
+    # The weekly tabs contain five weekday groups, normally four
+    # columns per group. The date is in the first row of each group,
+    # in the supplier/detail column immediately after the time column.
+    for sheet_name in workbook.sheet_names:
+        if sheet_name.strip().lower() in {"maris", "rejected"}:
+            continue
+
+        raw = pd.read_excel(
+            workbook,
+            sheet_name=sheet_name,
+            header=None,
+        )
+
+        if raw.empty or len(raw.index) < 4:
+            continue
+
+        # Monday-Friday groups start at columns 0, 4, 8, 12 and 16.
+        for base_col in (0, 4, 8, 12, 16):
+            date_col = base_col + 1
+
+            if date_col >= raw.shape[1]:
+                continue
+
+            booking_date = parse_date(raw.iat[0, date_col])
+
+            if booking_date is None:
+                continue
+
+            # Rows 0-2 contain dates, weekday names and summary headings.
+            for row_index in range(3, len(raw.index)):
+                if base_col >= raw.shape[1]:
+                    continue
+
+                booking_time = parse_time(raw.iat[row_index, base_col])
+
+                # Entries such as TBC or text instructions do not
+                # have a definite planned time, so they are skipped.
+                if booking_time is None:
+                    continue
+
+                details = []
+
+                for col_index in range(base_col + 1, base_col + 4):
+                    if col_index >= raw.shape[1]:
+                        continue
+
+                    text_value = clean_cell(
+                        raw.iat[row_index, col_index]
+                    )
+
+                    if text_value:
+                        details.append(text_value)
+
+                if not details:
+                    continue
+
+                title = " · ".join(details)
+                title_lower = title.casefold()
+
+                # Avoid importing instruction-only cells as bookings.
+                if any(
+                    phrase in title_lower
+                    for phrase in (
+                        "no deliveries",
+                        "engagement day",
+                        "bank holiday",
+                        "do not forget",
+                    )
+                ):
+                    continue
+
+                start_dt = datetime.combine(
+                    booking_date, booking_time
+                ).replace(tzinfo=UK)
+
+                key = (
+                    title.casefold(),
+                    start_dt.isoformat(),
+                )
+
+                bookings[key] = {
+                    "title": title,
+                    "start": start_dt,
+                    "end": start_dt + timedelta(hours=1),
+                    # The existing Supabase source constraint permits
+                    # Campey, Bulk and Manual. Bulk is displayed as
+                    # "Bulk Inbound" throughout the app.
+                    "source": "Bulk",
+                    "colour": AMBER,
+                }
+
+    return list(bookings.values())
+
+
+# ============================================================
+# SENT-LOAD CSV CHECK — CAMPEY ONLY
 # ============================================================
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -362,7 +481,6 @@ def get_sent_loads():
         load_ref = refs.iloc[0]
         sent_at = None
 
-        # Prefer the Date recorded inside the CSV.
         if date_col:
             dates = frame[date_col].dropna().astype(str).str.strip()
             dates = dates[dates != ""]
@@ -377,7 +495,7 @@ def get_sent_loads():
                 if not pd.isna(parsed):
                     sent_at = parsed.to_pydatetime()
 
-        # Fallback for names like H43474_20261002_224101.csv.
+        # Fallback for filenames such as H43474_20261002_224101.csv.
         if sent_at is None:
             match = re.search(
                 r"_(\d{8})_(\d{6})\.csv$",
@@ -408,22 +526,19 @@ def get_sent_loads():
             "filename": filename,
         })
 
-    # Earliest sent CSV first.
     loads.sort(key=lambda load: (load["sent_at"], load["filename"]))
-
     return loads
 
 
 def decorate_events(events, sent_loads, now):
-    """Match sent loads to same-day Campey bookings, one-to-one."""
+    """Only Campey events receive green/red sent-load status."""
 
     loads_by_day = {}
 
     for load in sent_loads:
-        day = load["sent_at"].date()
-        loads_by_day.setdefault(day, []).append(load)
+        loads_by_day.setdefault(load["sent_at"].date(), []).append(load)
 
-    bookings_by_day = {}
+    campey_by_day = {}
 
     for event in events:
         if event.get("source", "Manual") != "Campey":
@@ -432,14 +547,14 @@ def decorate_events(events, sent_loads, now):
         start_dt = local_datetime(event.get("start"))
 
         if start_dt:
-            bookings_by_day.setdefault(
+            campey_by_day.setdefault(
                 start_dt.date(), []
             ).append((start_dt, event))
 
     decorated = []
 
-    for day, bookings in bookings_by_day.items():
-        # Earliest planned booking gets the earliest sent load.
+    # Match CSV loads to Campey bookings, one-to-one, by day.
+    for day, bookings in campey_by_day.items():
         bookings.sort(
             key=lambda pair: (
                 pair[0],
@@ -454,7 +569,6 @@ def decorate_events(events, sent_loads, now):
 
             if index < len(day_loads):
                 load = day_loads[index]
-
                 item["_display_title"] = load["load_ref"]
                 item["_display_colour"] = GREEN
                 item["_sent"] = True
@@ -463,15 +577,12 @@ def decorate_events(events, sent_loads, now):
                 item["_display_title"] = event.get("title", "")
                 item["_sent"] = False
                 item["_sent_filename"] = ""
-
-                # Red only once the planned time has passed.
-                item["_display_colour"] = (
-                    RED if start_dt < now else BLUE
-                )
+                item["_display_colour"] = RED if start_dt < now else BLUE
 
             decorated.append(item)
 
-    # Bulk and manual bookings keep their original titles and colours.
+    # Bulk Inbound and Manual events keep their own colours.
+    # They are never assigned green or red status.
     for event in events:
         if event.get("source", "Manual") == "Campey":
             continue
@@ -491,12 +602,67 @@ def decorate_events(events, sent_loads, now):
 
 
 # ============================================================
+# SHARED IMPORT HANDLER
+# ============================================================
+
+def import_bookings(parsed, file_hash, filename):
+    existing = get_events()
+    existing_keys = set()
+
+    for event in existing:
+        start_dt = local_datetime(event.get("start"))
+
+        if start_dt:
+            existing_keys.add((
+                str(event.get("title", "")).strip().casefold(),
+                start_dt.isoformat(),
+                event.get("source", "Manual"),
+            ))
+
+    rows_to_insert = []
+
+    for row in parsed:
+        source = row["source"]
+
+        key = (
+            row["title"].strip().casefold(),
+            row["start"].isoformat(),
+            source,
+        )
+
+        if key in existing_keys:
+            continue
+
+        rows_to_insert.append({
+            "id": str(uuid.uuid4()),
+            "title": row["title"],
+            "start": row["start"].isoformat(),
+            "end": row["end"].isoformat(),
+            "source": source,
+            "colour": SOURCE_COLOURS.get(source, PURPLE),
+        })
+
+        existing_keys.add(key)
+
+    if rows_to_insert:
+        # Insert in batches to avoid oversized requests.
+        for offset in range(0, len(rows_to_insert), 100):
+            supabase.table("events").insert(
+                rows_to_insert[offset:offset + 100]
+            ).execute()
+
+    remember_import(file_hash, filename)
+
+    return len(rows_to_insert)
+
+
+# ============================================================
 # MAIN PAGE
 # ============================================================
 
 st.title("🚚 DDS Transport Calendar")
 st.caption(
-    "Shared calendar • Supabase bookings • automatic sent-load checking"
+    "Shared calendar • Supabase bookings • Campey sent-load checking"
 )
 
 try:
@@ -519,11 +685,13 @@ display_events = decorate_events(events, sent_loads, now)
 if github_error:
     st.warning(
         "Could not check the saved-load CSVs in GitHub. "
-        "Sent/overdue colours may be out of date. "
+        "Campey sent/overdue colours may be out of date. "
         f"Details: {github_error}"
     )
 
-sent_count = sum(event.get("_sent", False) for event in display_events)
+sent_count = sum(
+    1 for event in display_events if event.get("_sent")
+)
 
 overdue_count = sum(
     1
@@ -535,15 +703,15 @@ overdue_count = sum(
 
 m1, m2, m3 = st.columns(3)
 m1.metric("Total bookings", len(events))
-m2.metric("Sent loads matched", sent_count)
-m3.metric("Past unmatched bookings", overdue_count)
+m2.metric("Campey loads matched", sent_count)
+m3.metric("Past unmatched Campey bookings", overdue_count)
 
 with st.expander("Calendar colour key"):
     st.markdown(
-        f'<span style="color:{BLUE}">■</span> Upcoming Campey booking &nbsp; '
-        f'<span style="color:{GREEN}">■</span> Sent — load reference shown &nbsp; '
-        f'<span style="color:{RED}">■</span> Planned time passed, no matching load &nbsp; '
-        f'<span style="color:{AMBER}">■</span> Bulk &nbsp; '
+        f'<span style="color:{BLUE}">■</span> Upcoming Campey &nbsp; '
+        f'<span style="color:{GREEN}">■</span> Campey sent &nbsp; '
+        f'<span style="color:{RED}">■</span> Campey overdue &nbsp; '
+        f'<span style="color:{AMBER}">■</span> Bulk Inbound &nbsp; '
         f'<span style="color:{PURPLE}">■</span> Manual',
         unsafe_allow_html=True,
     )
@@ -571,35 +739,36 @@ for event in display_events:
         "backgroundColor": event.get("_display_colour", PURPLE),
         "borderColor": event.get("_display_colour", PURPLE),
         "extendedProps": {
-            "source": event.get("source", "Manual"),
+            "source": SOURCE_LABELS.get(
+                event.get("source", "Manual"),
+                event.get("source", "Manual"),
+            ),
             "originalTitle": event.get("title", ""),
             "sent": event.get("_sent", False),
             "sentFilename": event.get("_sent_filename", ""),
         },
     })
 
-calendar_options = {
-    "initialView": "dayGridMonth",
-    "headerToolbar": {
-        "left": "prev,next today",
-        "center": "title",
-        "right": "dayGridMonth,timeGridWeek,timeGridDay,listMonth",
-    },
-    "editable": False,
-    "selectable": False,
-    "nowIndicator": True,
-    "height": 760,
-    "eventDisplay": "block",
-    "dayMaxEvents": True,
-    "slotMinTime": "05:00:00",
-    "slotMaxTime": "22:00:00",
-    "firstDay": 1,
-    "timeZone": "local",
-}
-
 calendar(
     events=calendar_events,
-    options=calendar_options,
+    options={
+        "initialView": "dayGridMonth",
+        "headerToolbar": {
+            "left": "prev,next today",
+            "center": "title",
+            "right": "dayGridMonth,timeGridWeek,timeGridDay,listMonth",
+        },
+        "editable": False,
+        "selectable": False,
+        "nowIndicator": True,
+        "height": 760,
+        "eventDisplay": "block",
+        "dayMaxEvents": True,
+        "slotMinTime": "05:00:00",
+        "slotMaxTime": "22:00:00",
+        "firstDay": 1,
+        "timeZone": "local",
+    },
     key="dds_transport_calendar",
 )
 
@@ -610,19 +779,16 @@ calendar(
 
 with st.expander("➕ Add a booking"):
     with st.form("add_booking", clear_on_submit=True):
-        title = st.text_input("Booking / delivery site")
+        title = st.text_input("Booking / delivery details")
 
         c1, c2 = st.columns(2)
         booking_date = c1.date_input("Date", value=date.today())
-        booking_time = c2.time_input(
-            "Planned time",
-            value=time(8, 0),
-        )
+        booking_time = c2.time_input("Planned time", value=time(8, 0))
 
         c3, c4 = st.columns(2)
-        source = c3.selectbox(
+        source_label = c3.selectbox(
             "Source",
-            ["Manual", "Campey", "Bulk"],
+            ["Manual", "Campey", "Bulk Inbound"],
         )
         duration = c4.number_input(
             "Duration (hours)",
@@ -639,11 +805,16 @@ with st.expander("➕ Add a booking"):
 
         if add_clicked:
             if not title.strip():
-                st.error("Please enter a booking or delivery site.")
+                st.error("Please enter booking details.")
             else:
                 start_dt = datetime.combine(
                     booking_date, booking_time
                 ).replace(tzinfo=UK)
+
+                source = (
+                    "Bulk" if source_label == "Bulk Inbound"
+                    else source_label
+                )
 
                 try:
                     save_event(
@@ -663,121 +834,154 @@ with st.expander("➕ Add a booking"):
 # ============================================================
 
 with st.expander("📥 Import Campey transport workbook"):
-    uploaded = st.file_uploader(
-        "Select the Excel workbook",
+    campey_file = st.file_uploader(
+        "Select the Campey Excel workbook",
         type=["xlsx", "xls"],
         key="campey_excel",
     )
 
-    if uploaded is not None:
-        file_bytes = uploaded.getvalue()
+    if campey_file is not None:
+        file_bytes = campey_file.getvalue()
         file_hash = hashlib.sha256(file_bytes).hexdigest()
 
         try:
-            imported_hashes = get_imported_hashes()
+            already_imported = file_hash in get_imported_hashes()
         except Exception as exc:
-            imported_hashes = set()
+            already_imported = False
             st.warning(f"Could not check import history: {exc}")
 
-        if file_hash in imported_hashes:
+        if already_imported:
             st.info("This exact workbook has already been imported.")
         else:
             try:
-                parsed = parse_workbook(file_bytes)
-
-                st.write(f"Found **{len(parsed)}** booking rows.")
+                parsed = parse_campey_workbook(file_bytes)
+                st.write(f"Found **{len(parsed)}** Campey bookings.")
 
                 if parsed:
-                    preview = pd.DataFrame([
-                        {
-                            "Date": row["start"].strftime("%d/%m/%Y"),
-                            "Planned time": row["start"].strftime("%H:%M"),
-                            "Del Site": row["title"],
-                        }
-                        for row in parsed
-                    ])
-
                     st.dataframe(
-                        preview,
+                        pd.DataFrame([
+                            {
+                                "Date": row["start"].strftime("%d/%m/%Y"),
+                                "Planned time": row["start"].strftime("%H:%M"),
+                                "Del Site": row["title"],
+                            }
+                            for row in parsed
+                        ]),
                         use_container_width=True,
                         hide_index=True,
                     )
 
                     if st.button(
-                        "Import these bookings",
+                        "Import Campey bookings",
                         type="primary",
-                        key="import_campey_button",
+                        key="import_campey",
                     ):
                         try:
-                            existing = get_events()
+                            count = import_bookings(
+                                parsed, file_hash, campey_file.name
+                            )
+                            st.success(
+                                f"Imported {count} new Campey bookings. "
+                                "Matching existing bookings were skipped."
+                            )
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Import failed: {exc}")
+                else:
+                    st.warning(
+                        "No bookings found. Check the Date, Planned Time "
+                        "and Del Site columns in the workbook."
+                    )
 
-                            existing_keys = set()
+            except Exception as exc:
+                st.error(f"Could not read the Campey workbook: {exc}")
 
-                            for event in existing:
-                                start_dt = local_datetime(event.get("start"))
 
-                                if start_dt:
-                                    existing_keys.add((
-                                        str(event.get("title", "")).strip().casefold(),
-                                        start_dt.isoformat(),
-                                        event.get("source", "Manual"),
-                                    ))
+# ============================================================
+# IMPORT BULK INBOUND WORKBOOK
+# ============================================================
 
-                            rows_to_insert = []
+with st.expander("📦 Import Bulk Inbound schedule"):
+    st.write(
+        "Upload the weekly Bulk Schedule workbook. Entries are imported "
+        "in amber and are not affected by Campey sent-load or overdue status."
+    )
 
-                            for row in parsed:
-                                key = (
-                                    row["title"].strip().casefold(),
-                                    row["start"].isoformat(),
-                                    "Campey",
-                                )
+    bulk_file = st.file_uploader(
+        "Select the Bulk Schedule Excel workbook",
+        type=["xlsx", "xls"],
+        key="bulk_excel",
+    )
 
-                                if key in existing_keys:
-                                    continue
+    if bulk_file is not None:
+        bulk_bytes = bulk_file.getvalue()
+        bulk_hash = hashlib.sha256(bulk_bytes).hexdigest()
 
-                                rows_to_insert.append({
-                                    "id": str(uuid.uuid4()),
-                                    "title": row["title"],
-                                    "start": row["start"].isoformat(),
-                                    "end": row["end"].isoformat(),
-                                    "source": "Campey",
-                                    "colour": BLUE,
-                                })
+        try:
+            already_imported = bulk_hash in get_imported_hashes()
+        except Exception as exc:
+            already_imported = False
+            st.warning(f"Could not check import history: {exc}")
 
-                                existing_keys.add(key)
+        if already_imported:
+            st.info("This exact Bulk Schedule workbook has already been imported.")
+        else:
+            try:
+                parsed_bulk = parse_bulk_workbook(bulk_bytes)
 
-                            if rows_to_insert:
-                                supabase.table("events").insert(
-                                    rows_to_insert
-                                ).execute()
+                st.write(
+                    f"Found **{len(parsed_bulk)}** timed Bulk Inbound entries."
+                )
 
-                            supabase.table("imported_files").upsert({
-                                "file_hash": file_hash,
-                                "filename": uploaded.name,
-                                "imported_at": datetime.now(UK).isoformat(),
-                            }).execute()
+                if parsed_bulk:
+                    bulk_preview = pd.DataFrame([
+                        {
+                            "Date": row["start"].strftime("%d/%m/%Y"),
+                            "Time": row["start"].strftime("%H:%M"),
+                            "Bulk Inbound details": row["title"],
+                        }
+                        for row in parsed_bulk
+                    ])
+
+                    st.dataframe(
+                        bulk_preview,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                    if st.button(
+                        "Import Bulk Inbound bookings",
+                        type="primary",
+                        key="import_bulk",
+                    ):
+                        try:
+                            count = import_bookings(
+                                parsed_bulk,
+                                bulk_hash,
+                                bulk_file.name,
+                            )
 
                             st.success(
-                                f"Imported {len(rows_to_insert)} new bookings. "
-                                "Existing matching bookings were skipped."
+                                f"Imported {count} new Bulk Inbound entries. "
+                                "Matching existing entries were skipped."
                             )
                             st.rerun()
 
                         except Exception as exc:
-                            st.error(f"Import failed: {exc}")
+                            st.error(f"Bulk import failed: {exc}")
 
                 else:
                     st.warning(
-                        "No bookings found. The workbook needs Date, "
-                        "Planned Time and Del Site columns."
+                        "No timed entries were found. Check that the workbook "
+                        "contains weekly tabs with dates, times and booking details."
                     )
 
             except Exception as exc:
-                st.error(f"Could not read the workbook: {exc}")
+                st.error(f"Could not read the Bulk Schedule workbook: {exc}")
 
 
 # ============================================================
-# EDIT OR DELETE A BOOKING
+# EDIT OR DELETE BOOKINGS
 # ============================================================
 
 with st.expander("✏️ Edit or delete a booking"):
@@ -788,17 +992,20 @@ with st.expander("✏️ Edit or delete a booking"):
 
         for event in events:
             start_dt = local_datetime(event.get("start"))
+            source_label = SOURCE_LABELS.get(
+                event.get("source", "Manual"),
+                event.get("source", "Manual"),
+            )
 
             if start_dt:
                 label = (
                     f"{start_dt:%d/%m/%Y %H:%M} — "
                     f"{event.get('title', '(untitled)')} "
-                    f"[{event.get('source', 'Manual')}]"
+                    f"[{source_label}]"
                 )
             else:
                 label = event.get("title", "(untitled)")
 
-            # Avoid label collisions if two bookings look identical.
             choices[f"{label} · {event['id'][:8]}"] = event
 
         selected_label = st.selectbox(
@@ -815,7 +1022,7 @@ with st.expander("✏️ Edit or delete a booking"):
 
         with st.form("edit_booking"):
             edit_title = st.text_input(
-                "Booking / delivery site",
+                "Booking / delivery details",
                 value=selected.get("title", ""),
             )
 
@@ -823,27 +1030,30 @@ with st.expander("✏️ Edit or delete a booking"):
             edit_date = ec1.date_input(
                 "Date",
                 value=selected_start.date(),
-                key="edit_booking_date",
+                key="edit_date",
             )
             edit_time = ec2.time_input(
                 "Planned time",
                 value=selected_start.time().replace(tzinfo=None),
-                key="edit_booking_time",
+                key="edit_time",
             )
 
             ec3, ec4 = st.columns(2)
 
-            source_options = ["Manual", "Campey", "Bulk"]
-            old_source = selected.get("source", "Manual")
+            source_options = ["Manual", "Campey", "Bulk Inbound"]
+            current_source = selected.get("source", "Manual")
+            current_label = SOURCE_LABELS.get(
+                current_source, current_source
+            )
 
-            edit_source = ec3.selectbox(
+            edit_source_label = ec3.selectbox(
                 "Source",
                 source_options,
                 index=(
-                    source_options.index(old_source)
-                    if old_source in source_options else 0
+                    source_options.index(current_label)
+                    if current_label in source_options else 0
                 ),
-                key="edit_booking_source",
+                key="edit_source",
             )
 
             old_duration = (
@@ -856,7 +1066,7 @@ with st.expander("✏️ Edit or delete a booking"):
                 max_value=12.0,
                 value=max(0.25, min(12.0, old_duration)),
                 step=0.25,
-                key="edit_booking_duration",
+                key="edit_duration",
             )
 
             save_clicked = st.form_submit_button(
@@ -866,18 +1076,24 @@ with st.expander("✏️ Edit or delete a booking"):
 
             if save_clicked:
                 if not edit_title.strip():
-                    st.error("Please enter a booking or delivery site.")
+                    st.error("Please enter booking details.")
                 else:
                     new_start = datetime.combine(
                         edit_date, edit_time
                     ).replace(tzinfo=UK)
+
+                    new_source = (
+                        "Bulk"
+                        if edit_source_label == "Bulk Inbound"
+                        else edit_source_label
+                    )
 
                     try:
                         save_event(
                             edit_title,
                             new_start,
                             new_start + timedelta(hours=float(edit_duration)),
-                            edit_source,
+                            new_source,
                             event_id=selected["id"],
                         )
                         st.success("Booking updated.")
@@ -906,13 +1122,13 @@ with st.expander("✏️ Edit or delete a booking"):
 
 
 # ============================================================
-# SENT LOAD DETAILS
+# SENT-LOAD DETAILS
 # ============================================================
 
-with st.expander("📄 Sent-load CSV details"):
+with st.expander("📄 Campey sent-load CSV details"):
     st.caption(
         f"Read-only source: {SENDER_REPO}/saved_loads. "
-        "Results are cached for 60 seconds."
+        "The CSV list refreshes every 60 seconds."
     )
 
     st.write(f"CSV loads found: **{len(sent_loads)}**")
@@ -934,12 +1150,11 @@ with st.expander("📄 Sent-load CSV details"):
         )
 
     st.caption(
-        "Matching rule: sent CSVs are grouped by their Date, then matched "
-        "to Campey bookings on the same day. The earliest sent load is "
-        "assigned to the earliest planned booking, one load per booking."
+        "Only Campey bookings are matched to sent-load CSVs. "
+        "Bulk Inbound bookings remain amber regardless of date."
     )
 
 st.caption(
-    "Bookings are shared through Supabase. If another user changes the "
-    "calendar, refresh the page to see the latest bookings."
+    "Bookings are shared through Supabase. Refresh the page to load "
+    "changes made by other users."
 )
