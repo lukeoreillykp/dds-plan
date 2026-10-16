@@ -223,14 +223,30 @@ supabase = get_supabase()
 
 
 def get_events():
-    response = (
-        supabase.table("events")
-        .select("id,title,start,end,colour,source,created_at")
-        .order("start")
-        .execute()
-    )
+    """Fetch every event from Supabase in batches of 1,000."""
+    all_events = []
+    page_size = 1000
+    start = 0
 
-    return response.data or []
+    while True:
+        response = (
+            supabase.table("events")
+            .select("id,title,start,end,colour,source,created_at")
+            .order("start")
+            .order("id")
+            .range(start, start + page_size - 1)
+            .execute()
+        )
+
+        batch = response.data or []
+        all_events.extend(batch)
+
+        if len(batch) < page_size:
+            break
+
+        start += page_size
+
+    return all_events
 
 
 def get_imported_hashes():
@@ -822,12 +838,12 @@ def decorate_events(events, sent_loads, now):
             continue
 
         item = dict(event)
-        item["_display_title"] = event.get("title", "")
+        item["_display_title"] = item.get("title", "")
         item["_sent"] = False
         item["_sent_filename"] = ""
         item["_display_colour"] = (
-            event.get("colour")
-            or SOURCE_COLOURS.get(event.get("source", "Manual"), PURPLE)
+            item.get("colour")
+            or SOURCE_COLOURS.get(item.get("source", "Manual"), PURPLE)
         )
 
         decorated.append(item)
