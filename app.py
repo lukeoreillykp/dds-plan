@@ -12,6 +12,7 @@ import streamlit as st
 from supabase import create_client
 from streamlit_calendar import calendar
 
+
 # ============================================================
 # CONFIGURATION
 # ============================================================
@@ -34,17 +35,20 @@ GREEN = "#239653"
 RED = "#d64545"
 PURPLE = "#7b61a8"
 AMBER = "#e0a126"
+DHL_COLOUR = "#159eaa"
 
 SOURCE_COLOURS = {
     "Campey": BLUE,
     "Bulk": AMBER,
     "Manual": PURPLE,
+    "DHL": DHL_COLOUR,
 }
 
 SOURCE_LABELS = {
     "Campey": "Campey",
     "Bulk": "Bulk Inbound",
     "Manual": "Manual",
+    "DHL": "DHL Collection",
 }
 
 
@@ -84,7 +88,6 @@ def parse_date(value):
         pass
 
     try:
-        # Excel date cells are often already datetime objects.
         if isinstance(value, (datetime, date, pd.Timestamp)):
             return pd.Timestamp(value).date()
 
@@ -102,11 +105,8 @@ def parse_date(value):
 
 def parse_time(value):
     """
-    Supports:
-      Excel numeric times such as 0.5 = 12:00
-      Whole-hour cells such as 7, 8, 13
-      Decimal-style cells such as 13.3 = 13:30
-      Text times such as 08:30 or 13:30
+    Supports Excel time fractions, whole hours, decimal-style times
+    such as 13.3 = 13:30, and text times such as 08:30.
     """
     if value is None:
         return None
@@ -123,41 +123,40 @@ def parse_time(value):
     if isinstance(value, (datetime, pd.Timestamp)):
         return value.time().replace(tzinfo=None)
 
-    # Handle numeric Excel values and numbers read from cells.
     try:
         number = float(value)
 
+        # Excel time fraction: 0.5 = 12:00.
         if 0 <= number < 1:
             seconds = round(number * 86400)
             return (datetime.min + timedelta(seconds=seconds)).time()
 
         if 0 <= number < 24:
-            # Whole number means an exact hour.
             if number.is_integer():
                 return time(int(number), 0)
 
-            # In this workbook, 14.3 represents 14:30, not 14:18.
             text = str(value).strip()
-            whole, decimal = text.split(".", 1)
 
-            hour = int(whole)
+            if "." in text:
+                whole, decimal = text.split(".", 1)
+                hour = int(whole)
 
-            if len(decimal) == 1:
-                minute = int(decimal) * 10
-            else:
-                minute = int(decimal[:2].ljust(2, "0"))
+                if len(decimal) == 1:
+                    minute = int(decimal) * 10
+                else:
+                    minute = int(decimal[:2].ljust(2, "0"))
 
-            if 0 <= hour < 24 and 0 <= minute < 60:
-                return time(hour, minute)
+                if 0 <= hour < 24 and 0 <= minute < 60:
+                    return time(hour, minute)
 
     except (ValueError, TypeError, OverflowError):
         pass
 
-    # Handle ordinary strings such as "08:30".
     try:
         text = str(value).strip()
 
         match = re.fullmatch(r"(\d{1,2})[:.](\d{2})", text)
+
         if match:
             hour = int(match.group(1))
             minute = int(match.group(2))
@@ -190,6 +189,14 @@ def clean_cell(value):
         return str(int(value))
 
     return str(value).strip()
+
+
+def make_booking_key(title, start_dt, source):
+    return (
+        str(title).strip().casefold(),
+        start_dt.isoformat(),
+        source,
+    )
 
 
 # ============================================================
@@ -233,10 +240,7 @@ def get_imported_hashes():
         .execute()
     )
 
-    return {
-        row["file_hash"]
-        for row in (response.data or [])
-    }
+    return {row["file_hash"] for row in (response.data or [])}
 
 
 def remember_import(file_hash, filename):
@@ -339,7 +343,7 @@ def parse_campey_workbook(file_bytes):
             None,
         )
 
-        if not date_col or not time_col or not site_col:
+        if date_col is None or time_col is None or site_col is None:
             continue
 
         for _, row in data.iterrows():
@@ -362,7 +366,7 @@ def parse_campey_workbook(file_bytes):
                 booking_date, booking_time
             ).replace(tzinfo=UK)
 
-            key = (site.casefold(), start_dt.isoformat())
+            key = make_booking_key(site, start_dt, "Campey")
 
             bookings[key] = {
                 "title": site,
@@ -381,12 +385,10 @@ def parse_campey_workbook(file_bytes):
 
 def parse_bulk_workbook(file_bytes):
     """
-    Read weekday groups from the Bulk Schedule workbook.
+    Each weekday uses a four-column group:
+    time | supplier/details | product/code | quantity/extra details.
 
-    Each weekday normally uses four columns:
-    time | supplier | product/reference | quantity/details
-
-    The date is taken from row 0 of the second column in each group.
+    The date is stored in row 0 of the second column in each group.
     """
     workbook = pd.ExcelFile(io.BytesIO(file_bytes))
     bookings = {}
@@ -404,7 +406,6 @@ def parse_bulk_workbook(file_bytes):
         if raw.empty or len(raw.index) < 4:
             continue
 
-        # Monday-Friday column groups.
         for base_col in (0, 4, 8, 12, 16):
             date_col = base_col + 1
 
@@ -416,14 +417,8 @@ def parse_bulk_workbook(file_bytes):
             if booking_date is None:
                 continue
 
-            # First rows contain dates, weekday names and summaries.
             for row_index in range(3, len(raw.index)):
-                if base_col >= raw.shape[1]:
-                    continue
-
-                booking_time = parse_time(
-                    raw.iat[row_index, base_col]
-                )
+                booking_time = parse_time(raw.iat[row_index, base_col])
 
                 if booking_time is None:
                     continue
@@ -434,12 +429,10 @@ def parse_bulk_workbook(file_bytes):
                     base_col + 1,
                     min(base_col + 4, raw.shape[1]),
                 ):
-                    text_value = clean_cell(
-                        raw.iat[row_index, col_index]
-                    )
+                    value = clean_cell(raw.iat[row_index, col_index])
 
-                    if text_value:
-                        details.append(text_value)
+                    if value:
+                        details.append(value)
 
                 if not details:
                     continue
@@ -447,7 +440,6 @@ def parse_bulk_workbook(file_bytes):
                 title = " · ".join(details)
                 title_lower = title.casefold()
 
-                # Ignore obvious instruction-only cells.
                 if any(
                     phrase in title_lower
                     for phrase in (
@@ -459,11 +451,10 @@ def parse_bulk_workbook(file_bytes):
                     continue
 
                 start_dt = datetime.combine(
-                    booking_date,
-                    booking_time,
+                    booking_date, booking_time
                 ).replace(tzinfo=UK)
 
-                key = (title.casefold(), start_dt.isoformat())
+                key = make_booking_key(title, start_dt, "Bulk")
 
                 bookings[key] = {
                     "title": title,
@@ -474,6 +465,187 @@ def parse_bulk_workbook(file_bytes):
                 }
 
     return list(bookings.values())
+
+
+# ============================================================
+# DHL PONTEFRACT WORKBOOK IMPORT
+# ============================================================
+
+def get_week_start_from_sheet(sheet_name):
+    """
+    Extract a week-commencing date from sheet names such as:
+    WC 140926, W.C. 140926, WC 14092026.
+
+    Returns None if the sheet name contains no recognised date.
+    """
+    match = re.search(
+        r"W\s*\.?\s*C\s*\.?\s*[-:]?\s*(\d{6}|\d{8})",
+        sheet_name,
+        re.IGNORECASE,
+    )
+
+    if not match:
+        # Also accept an unlabelled date in a sheet name if it
+        # looks like DDMMYY or DDMMYYYY.
+        match = re.search(r"(?<!\d)(\d{8}|\d{6})(?!\d)", sheet_name)
+
+    if not match:
+        return None
+
+    value = match.group(1)
+
+    for fmt in (
+        "%d%m%Y" if len(value) == 8 else "%d%m%y",
+        "%Y%m%d" if len(value) == 8 else "%y%m%d",
+    ):
+        try:
+            return datetime.strptime(value, fmt).date()
+        except ValueError:
+            continue
+
+    return None
+
+
+def is_one(value):
+    """Return True only for a numeric cell whose value is exactly 1."""
+    if value is None:
+        return False
+
+    try:
+        if pd.isna(value):
+            return False
+
+        return float(value) == 1
+    except (TypeError, ValueError):
+        return False
+
+
+def parse_dhl_workbook(file_bytes):
+    """
+    Parse the Factory Movements workbook.
+
+    Only rows whose label starts with PONTEFRACT are considered.
+    Each hourly cell containing exactly 1 creates a DHL Collection.
+    Weekly totals and daily TOTAL columns are not imported.
+    Historical dates are included.
+    """
+    workbook = pd.ExcelFile(io.BytesIO(file_bytes))
+    bookings = {}
+
+    weekday_offsets = {
+        "SUN": 0,
+        "MON": 1,
+        "TUE": 2,
+        "WED": 3,
+        "THU": 4,
+        "FRI": 5,
+        "SAT": 6,
+    }
+
+    for sheet_name in workbook.sheet_names:
+        raw = pd.read_excel(
+            workbook,
+            sheet_name=sheet_name,
+            header=None,
+        )
+
+        if raw.empty:
+            continue
+
+        week_start = get_week_start_from_sheet(sheet_name)
+
+        # Each weekday header row defines the date and hourly columns.
+        for header_row in range(len(raw.index)):
+            first_cell = clean_cell(raw.iat[header_row, 0]).upper()
+            day_key = first_cell[:3]
+
+            if day_key not in weekday_offsets:
+                continue
+
+            if week_start is None:
+                # Fallback: try the date cell in the same header row.
+                header_date = None
+
+                for col in range(1, raw.shape[1]):
+                    header_date = parse_date(raw.iat[header_row, col])
+
+                    if header_date:
+                        break
+
+                if header_date is None:
+                    continue
+
+                # The date in the header row is the best available
+                # anchor if the sheet name doesn't include a week date.
+                collection_date = header_date
+            else:
+                collection_date = week_start + timedelta(
+                    days=weekday_offsets[day_key]
+                )
+
+            hourly_columns = []
+
+            for col in range(1, raw.shape[1]):
+                heading = raw.iat[header_row, col]
+                heading_text = clean_cell(heading).upper()
+
+                # Explicitly ignore totals and date cells.
+                if (
+                    heading_text == "TOTAL"
+                    or "TOTAL" in heading_text
+                    or parse_date(heading) is not None
+                ):
+                    continue
+
+                parsed_time = parse_time(heading)
+
+                if parsed_time is None:
+                    continue
+
+                # A time heading identifies an hourly slot.
+                hourly_columns.append(
+                    (col, time(parsed_time.hour, 0))
+                )
+
+            if not hourly_columns:
+                continue
+
+            # Scan rows until the next weekday header.
+            for row_index in range(header_row + 1, len(raw.index)):
+                row_label = clean_cell(raw.iat[row_index, 0]).upper()
+
+                if row_label[:3] in weekday_offsets:
+                    break
+
+                if not row_label.startswith("PONTEFRACT"):
+                    continue
+
+                for col, hour in hourly_columns:
+                    if not is_one(raw.iat[row_index, col]):
+                        continue
+
+                    start_dt = datetime.combine(
+                        collection_date, hour
+                    ).replace(tzinfo=UK)
+
+                    title = "DHL Collection - Pontefract"
+
+                    # One event per date/hour. Repeated weekly sheets
+                    # or duplicate rows won't create duplicate slots.
+                    key = make_booking_key(title, start_dt, "DHL")
+
+                    bookings[key] = {
+                        "title": title,
+                        "start": start_dt,
+                        "end": start_dt + timedelta(hours=1),
+                        "source": "DHL",
+                        "colour": DHL_COLOUR,
+                    }
+
+    return sorted(
+        bookings.values(),
+        key=lambda item: item["start"],
+    )
 
 
 # ============================================================
@@ -494,10 +666,9 @@ def get_sent_loads():
     )
     response.raise_for_status()
 
-    files = response.json()
     loads = []
 
-    for item in files:
+    for item in response.json():
         filename = item.get("name", "")
 
         if (
@@ -563,7 +734,6 @@ def get_sent_loads():
                 if not pd.isna(parsed):
                     sent_at = parsed.to_pydatetime()
 
-        # Filename fallback, e.g. H43474_20261002_224101.csv.
         if sent_at is None:
             match = re.search(
                 r"_(\d{8})_(\d{6})\.csv$",
@@ -599,14 +769,11 @@ def get_sent_loads():
 
 
 def decorate_events(events, sent_loads, now):
-    """Apply green/red behaviour to Campey events only."""
-
+    """Apply sent/overdue colours to Campey events only."""
     loads_by_day = {}
 
     for load in sent_loads:
-        loads_by_day.setdefault(
-            load["sent_at"].date(), []
-        ).append(load)
+        loads_by_day.setdefault(load["sent_at"].date(), []).append(load)
 
     campey_by_day = {}
 
@@ -617,19 +784,15 @@ def decorate_events(events, sent_loads, now):
         start_dt = local_datetime(event.get("start"))
 
         if start_dt:
-            campey_by_day.setdefault(
-                start_dt.date(), []
-            ).append((start_dt, event))
+            campey_by_day.setdefault(start_dt.date(), []).append(
+                (start_dt, event)
+            )
 
     decorated = []
 
-    # Match one sent load per Campey booking, in time order.
     for day, bookings in campey_by_day.items():
         bookings.sort(
-            key=lambda pair: (
-                pair[0],
-                str(pair[1].get("id", "")),
-            )
+            key=lambda pair: (pair[0], str(pair[1].get("id", "")))
         )
 
         day_loads = loads_by_day.get(day, [])
@@ -647,11 +810,13 @@ def decorate_events(events, sent_loads, now):
                 item["_display_title"] = event.get("title", "")
                 item["_sent"] = False
                 item["_sent_filename"] = ""
-                item["_display_colour"] = RED if start_dt < now else BLUE
+                item["_display_colour"] = (
+                    RED if start_dt < now else BLUE
+                )
 
             decorated.append(item)
 
-    # Bulk and Manual bookings keep their own colour and title.
+    # Non-Campey sources keep their saved title and colour.
     for event in events:
         if event.get("source", "Manual") == "Campey":
             continue
@@ -671,9 +836,8 @@ def decorate_events(events, sent_loads, now):
 
 
 # ============================================================
-# IMPORT HANDLER
-# Allows a previously imported file to be re-scanned for missing
-# rows. Duplicate bookings are skipped by title, date, time, source.
+# IMPORT HELPER
+# Re-scans files and skips matching existing events.
 # ============================================================
 
 def import_bookings(parsed, file_hash, filename):
@@ -684,20 +848,22 @@ def import_bookings(parsed, file_hash, filename):
         start_dt = local_datetime(event.get("start"))
 
         if start_dt:
-            existing_keys.add((
-                str(event.get("title", "")).strip().casefold(),
-                start_dt.isoformat(),
-                event.get("source", "Manual"),
-            ))
+            existing_keys.add(
+                make_booking_key(
+                    event.get("title", ""),
+                    start_dt,
+                    event.get("source", "Manual"),
+                )
+            )
 
     rows_to_insert = []
 
     for row in parsed:
         source = row["source"]
 
-        key = (
-            row["title"].strip().casefold(),
-            row["start"].isoformat(),
+        key = make_booking_key(
+            row["title"],
+            row["start"],
             source,
         )
 
@@ -708,7 +874,7 @@ def import_bookings(parsed, file_hash, filename):
             "id": str(uuid.uuid4()),
             "title": row["title"],
             "start": row["start"].isoformat(),
-            "end": row["end"].isoformat(),
+            "end": row["end"].isoformat() if row.get("end") else None,
             "source": source,
             "colour": SOURCE_COLOURS.get(source, PURPLE),
         })
@@ -721,7 +887,6 @@ def import_bookings(parsed, file_hash, filename):
         ).execute()
 
     remember_import(file_hash, filename)
-
     return len(rows_to_insert)
 
 
@@ -753,14 +918,12 @@ display_events = decorate_events(events, sent_loads, now)
 
 if github_error:
     st.warning(
-        "Could not check the saved-load CSVs in GitHub. "
+        "Could not check saved-load CSVs in GitHub. "
         "Campey sent/overdue colours may be out of date. "
         f"Details: {github_error}"
     )
 
-sent_count = sum(
-    1 for event in display_events if event.get("_sent")
-)
+sent_count = sum(1 for event in display_events if event.get("_sent"))
 
 overdue_count = sum(
     1
@@ -781,7 +944,8 @@ with st.expander("Calendar colour key"):
         f'<span style="color:{GREEN}">■</span> Campey sent &nbsp; '
         f'<span style="color:{RED}">■</span> Campey overdue &nbsp; '
         f'<span style="color:{AMBER}">■</span> Bulk Inbound &nbsp; '
-        f'<span style="color:{PURPLE}">■</span> Manual',
+        f'<span style="color:{PURPLE}">■</span> Manual &nbsp; '
+        f'<span style="color:{DHL_COLOUR}">■</span> DHL Collection',
         unsafe_allow_html=True,
     )
 
@@ -798,15 +962,15 @@ for event in display_events:
         or start_dt + timedelta(hours=1)
     )
 
+    colour = event.get("_display_colour", PURPLE)
+
     calendar_events.append({
         "id": str(event.get("id", "")),
-        "title": event.get(
-            "_display_title", event.get("title", "")
-        ),
+        "title": event.get("_display_title", event.get("title", "")),
         "start": start_dt.isoformat(),
         "end": end_dt.isoformat(),
-        "backgroundColor": event.get("_display_colour", PURPLE),
-        "borderColor": event.get("_display_colour", PURPLE),
+        "backgroundColor": colour,
+        "borderColor": colour,
         "extendedProps": {
             "source": SOURCE_LABELS.get(
                 event.get("source", "Manual"),
@@ -833,8 +997,8 @@ calendar(
         "height": 760,
         "eventDisplay": "block",
         "dayMaxEvents": True,
-        "slotMinTime": "05:00:00",
-        "slotMaxTime": "22:00:00",
+        "slotMinTime": "00:00:00",
+        "slotMaxTime": "24:00:00",
         "firstDay": 1,
         "timeZone": "local",
     },
@@ -857,7 +1021,7 @@ with st.expander("➕ Add a booking"):
         c3, c4 = st.columns(2)
         source_label = c3.selectbox(
             "Source",
-            ["Manual", "Campey", "Bulk Inbound"],
+            ["Manual", "Campey", "Bulk Inbound", "DHL Collection"],
         )
         duration = c4.number_input(
             "Duration (hours)",
@@ -867,10 +1031,7 @@ with st.expander("➕ Add a booking"):
             step=0.25,
         )
 
-        add_clicked = st.form_submit_button(
-            "Add booking",
-            type="primary",
-        )
+        add_clicked = st.form_submit_button("Add booking", type="primary")
 
         if add_clicked:
             if not title.strip():
@@ -880,10 +1041,10 @@ with st.expander("➕ Add a booking"):
                     booking_date, booking_time
                 ).replace(tzinfo=UK)
 
-                source = (
-                    "Bulk" if source_label == "Bulk Inbound"
-                    else source_label
-                )
+                source = {
+                    "Bulk Inbound": "Bulk",
+                    "DHL Collection": "DHL",
+                }.get(source_label, source_label)
 
                 try:
                     save_event(
@@ -920,8 +1081,8 @@ with st.expander("📥 Import Campey transport workbook"):
 
         if already_imported:
             st.info(
-                "This workbook was imported previously. You can still "
-                "re-scan it to add any missing bookings."
+                "This workbook was imported previously. You can re-scan "
+                "it to add missing bookings."
             )
 
         try:
@@ -953,7 +1114,7 @@ with st.expander("📥 Import Campey transport workbook"):
                         )
                         st.success(
                             f"Added {count} new Campey bookings. "
-                            "Existing matching bookings were skipped."
+                            "Matching existing bookings were skipped."
                         )
                         st.rerun()
                     except Exception as exc:
@@ -974,8 +1135,8 @@ with st.expander("📥 Import Campey transport workbook"):
 
 with st.expander("📦 Import Bulk Inbound schedule"):
     st.write(
-        "Upload the weekly Bulk Schedule workbook. Entries are amber "
-        "and do not use Campey sent-load or overdue behaviour."
+        "Each timed row becomes a booking. Bulk events remain amber "
+        "and are not affected by Campey sent-load matching."
     )
 
     bulk_file = st.file_uploader(
@@ -995,13 +1156,12 @@ with st.expander("📦 Import Bulk Inbound schedule"):
 
         if already_imported:
             st.info(
-                "This workbook was imported previously. You can still "
-                "re-scan it to add missing entries from the earlier attempt."
+                "This workbook was imported previously. Re-scanning "
+                "adds any missing bookings."
             )
 
         try:
             parsed_bulk = parse_bulk_workbook(bulk_bytes)
-
             st.write(
                 f"Found **{len(parsed_bulk)}** timed Bulk Inbound entries."
             )
@@ -1027,11 +1187,8 @@ with st.expander("📦 Import Bulk Inbound schedule"):
                 ):
                     try:
                         count = import_bookings(
-                            parsed_bulk,
-                            bulk_hash,
-                            bulk_file.name,
+                            parsed_bulk, bulk_hash, bulk_file.name
                         )
-
                         st.success(
                             f"Added {count} new Bulk Inbound entries. "
                             "Existing matching entries were skipped."
@@ -1039,15 +1196,97 @@ with st.expander("📦 Import Bulk Inbound schedule"):
                         st.rerun()
                     except Exception as exc:
                         st.error(f"Bulk import failed: {exc}")
-
             else:
                 st.warning(
-                    "No timed entries found. Check the weekly tabs, dates, "
-                    "times and booking details in the workbook."
+                    "No timed entries found. Check the weekly tabs, "
+                    "dates, times and booking details."
                 )
 
         except Exception as exc:
             st.error(f"Could not read the Bulk Schedule workbook: {exc}")
+
+
+# ============================================================
+# IMPORT DHL PONTEFRACT COLLECTIONS
+# ============================================================
+
+with st.expander("🚚 Import DHL collections — Pontefract only"):
+    st.write(
+        "Historical and future dates are included. Each hourly cell "
+        "containing exactly 1 in a PONTEFRACT row creates one teal "
+        "DHL Collection event. Weekly totals and daily total columns "
+        "are ignored."
+    )
+
+    dhl_file = st.file_uploader(
+        "Select the Factory Movements workbook",
+        type=["xlsx", "xls"],
+        key="dhl_excel",
+    )
+
+    if dhl_file is not None:
+        dhl_bytes = dhl_file.getvalue()
+        dhl_hash = hashlib.sha256(dhl_bytes).hexdigest()
+
+        try:
+            already_imported = dhl_hash in get_imported_hashes()
+        except Exception:
+            already_imported = False
+
+        if already_imported:
+            st.info(
+                "This workbook was imported previously. Re-scanning "
+                "will add missing events and skip matching existing ones."
+            )
+
+        try:
+            parsed_dhl = parse_dhl_workbook(dhl_bytes)
+
+            st.write(
+                f"Found **{len(parsed_dhl)}** DHL collection time slots."
+            )
+
+            if parsed_dhl:
+                preview = pd.DataFrame([
+                    {
+                        "Date": item["start"].strftime("%d/%m/%Y"),
+                        "Time": item["start"].strftime("%H:%M"),
+                        "Collection": item["title"],
+                    }
+                    for item in parsed_dhl
+                ])
+
+                st.dataframe(
+                    preview,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                if st.button(
+                    "Import / re-scan DHL collections",
+                    type="primary",
+                    key="import_dhl",
+                ):
+                    try:
+                        count = import_bookings(
+                            parsed_dhl, dhl_hash, dhl_file.name
+                        )
+                        st.success(
+                            f"Added {count} new DHL collection events. "
+                            "Existing matching events were skipped."
+                        )
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"DHL import failed: {exc}")
+            else:
+                st.warning(
+                    "No DHL collection slots were found. Check the "
+                    "sheet names, weekday headings, time headings, and "
+                    "PONTEFRACT rows in the workbook."
+                )
+
+        except Exception as exc:
+            st.error(f"Could not parse the DHL workbook: {exc}")
 
 
 # ============================================================
@@ -1108,7 +1347,12 @@ with st.expander("✏️ Edit or delete a booking"):
             )
 
             ec3, ec4 = st.columns(2)
-            source_options = ["Manual", "Campey", "Bulk Inbound"]
+            source_options = [
+                "Manual",
+                "Campey",
+                "Bulk Inbound",
+                "DHL Collection",
+            ]
 
             current_source = selected.get("source", "Manual")
             current_label = SOURCE_LABELS.get(
@@ -1151,11 +1395,10 @@ with st.expander("✏️ Edit or delete a booking"):
                         edit_date, edit_time
                     ).replace(tzinfo=UK)
 
-                    new_source = (
-                        "Bulk"
-                        if edit_source_label == "Bulk Inbound"
-                        else edit_source_label
-                    )
+                    new_source = {
+                        "Bulk Inbound": "Bulk",
+                        "DHL Collection": "DHL",
+                    }.get(edit_source_label, edit_source_label)
 
                     try:
                         save_event(
@@ -1220,7 +1463,7 @@ with st.expander("📄 Campey sent-load CSV details"):
 
     st.caption(
         "Only Campey bookings receive green sent or red overdue status. "
-        "Bulk Inbound bookings remain amber."
+        "Bulk Inbound remains amber and DHL collections remain teal."
     )
 
 st.caption(
