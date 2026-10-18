@@ -101,4 +101,4 @@ def test_event_input_is_not_modified(self):
     self.assertEqual(events[0], original)
 
 if name == "main":
-unittest.main()
+unittest.main() 
