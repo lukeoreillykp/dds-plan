@@ -490,8 +490,8 @@ def parse_dhl_header_date(value):
     """
     Parse a week date from the worksheet header area.
 
-    Supports Excel date cells and text dates such as 7/5/2026,
-    interpreted as July 5, 2026 (month/day/year).
+    Supports Excel date cells and text dates. UK day/month/year formats
+    are tried first, with month/day/year formats retained as a fallback.
 
     Ordinary numeric hour headings are not treated as dates.
     """
@@ -525,7 +525,12 @@ def parse_dhl_header_date(value):
     if not text:
         return None
 
+    # FIX: This is a UK workbook. Try day/month/year before US formats.
     for fmt in (
+        "%d/%m/%Y",
+        "%d/%m/%y",
+        "%d-%m-%Y",
+        "%d-%m-%y",
         "%m/%d/%Y",
         "%m/%d/%y",
         "%m-%d-%Y",
@@ -590,7 +595,7 @@ def parse_dhl_workbook(file_bytes):
     Parse every weekly worksheet in the Factory Movements workbook.
 
     Each worksheet represents one week. Its week-start date is read
-    from the top-left five-by-five cell area.
+    from the top-left header area, including row 6 on some sheets.
 
     Only PONTEFRACT rows are imported. Each hourly cell containing
     exactly 1 creates a DHL Collection event. TOTAL columns are ignored.
@@ -619,11 +624,11 @@ def parse_dhl_workbook(file_bytes):
         if raw.empty or raw.shape[1] < 2:
             continue
 
-        # Read the week date from the top-left header area only.
-        # Do not use timestamps elsewhere in the worksheet.
+        # FIX: Some workbook versions put the week date in A6.
+        # Search the first 10 rows, but do not scan the entire sheet.
         week_start = None
 
-        for row_index in range(min(5, raw.shape[0])):
+        for row_index in range(min(10, raw.shape[0])):
             for col_index in range(min(5, raw.shape[1])):
                 candidate = parse_dhl_header_date(
                     raw.iat[row_index, col_index]
