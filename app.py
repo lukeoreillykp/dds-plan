@@ -50,6 +50,8 @@ SOURCE_LABELS = {
     "DHL": "DHL Collection",
 }
 
+STATUS_OPTIONS = ["scheduled", "complete", "cancelled"]
+
 
 # ============================================================
 # GENERAL HELPERS
@@ -125,7 +127,6 @@ def parse_time(value):
     try:
         number = float(value)
 
-        # Excel time fraction: 0.5 = 12:00.
         if 0 <= number < 1:
             seconds = round(number * 86400)
             return (datetime.min + timedelta(seconds=seconds)).time()
@@ -153,7 +154,6 @@ def parse_time(value):
 
     try:
         text = str(value).strip()
-
         match = re.fullmatch(r"(\d{1,2})[:.](\d{2})", text)
 
         if match:
@@ -230,7 +230,10 @@ def get_events():
     while True:
         response = (
             supabase.table("events")
-            .select("id,title,start,end,colour,source,created_at")
+            .select(
+                "id,title,start,end,colour,source,created_at,"
+                "status,load_header"
+            )
             .order("start")
             .order("id")
             .range(start, start + page_size - 1)
@@ -244,6 +247,11 @@ def get_events():
             break
 
         start += page_size
+
+    # Protect against older rows or unexpected null values.
+    for event in all_events:
+        if not event.get("status"):
+            event["status"] = "scheduled"
 
     return all_events
 
@@ -266,7 +274,15 @@ def remember_import(file_hash, filename):
     }).execute()
 
 
-def save_event(title, start_dt, end_dt, source, event_id=None):
+def save_event(
+    title,
+    start_dt,
+    end_dt,
+    source,
+    event_id=None,
+    status=None,
+    load_header=None,
+):
     payload = {
         "title": title.strip(),
         "start": start_dt.astimezone(UK).isoformat(),
@@ -275,6 +291,14 @@ def save_event(title, start_dt, end_dt, source, event_id=None):
         "colour": SOURCE_COLOURS.get(source, PURPLE),
     }
 
+    # Only change status/header when explicitly supplied.
+    # Ordinary edits therefore preserve existing status.
+    if status is not None:
+        payload["status"] = status
+
+    if load_header is not None:
+        payload["load_header"] = load_header.strip() or None
+
     if event_id:
         supabase.table("events").update(payload).eq(
             "id", event_id
@@ -282,6 +306,18 @@ def save_event(title, start_dt, end_dt, source, event_id=None):
     else:
         payload["id"] = str(uuid.uuid4())
         supabase.table("events").insert(payload).execute()
+
+
+def update_event_status(event_id, status, load_header=None):
+    """Update a Bulk/DHL status without changing its booking details."""
+    payload = {"status": status}
+
+    if load_header is not None:
+        payload["load_header"] = load_header.strip() or None
+
+    supabase.table("events").update(payload).eq(
+        "id", event_id
+    ).execute()
 
 
 # ============================================================
@@ -489,11 +525,7 @@ def parse_bulk_workbook(file_bytes):
 def parse_dhl_header_date(value):
     """
     Parse a week date from the worksheet header area.
-
-    Supports Excel date cells and text dates. UK day/month/year formats
-    are tried first, with month/day/year formats retained as a fallback.
-
-    Ordinary numeric hour headings are not treated as dates.
+    UK day/month/year formats are tried before US formats.
     """
     if value is None:
         return None
@@ -507,7 +539,6 @@ def parse_dhl_header_date(value):
     if isinstance(value, (datetime, date, pd.Timestamp)):
         return pd.Timestamp(value).date()
 
-    # Handle an Excel date serial if it wasn't decoded as a date.
     if isinstance(value, (int, float)):
         if 20000 <= value <= 80000:
             try:
@@ -525,7 +556,6 @@ def parse_dhl_header_date(value):
     if not text:
         return None
 
-    # FIX: This is a UK workbook. Try day/month/year before US formats.
     for fmt in (
         "%d/%m/%Y",
         "%d/%m/%y",
@@ -546,10 +576,7 @@ def parse_dhl_header_date(value):
 
 
 def get_week_start_from_sheet(sheet_name):
-    """
-    Compatibility helper for worksheet names that contain a date.
-    The DHL parser uses the date in the worksheet header instead.
-    """
+    """Compatibility helper for worksheet names that contain a date."""
     match = re.search(
         r"W\s*\.?\s*C\s*\.?\s*[-:]?\s*(\d{6}|\d{8})",
         sheet_name,
@@ -593,13 +620,8 @@ def is_one(value):
 def parse_dhl_workbook(file_bytes):
     """
     Parse every weekly worksheet in the Factory Movements workbook.
-
-    Each worksheet represents one week. Its week-start date is read
-    from the top-left header area, including row 6 on some sheets.
-
-    Only PONTEFRACT rows are imported. Each hourly cell containing
-    exactly 1 creates a DHL Collection event. TOTAL columns are ignored.
-    Duplicate date/time slots are collapsed into one event.
+    Only PONTEFRACT rows are imported. Hourly cells containing exactly
+    1 create DHL Collection events. TOTAL columns are ignored.
     """
     workbook = pd.ExcelFile(io.BytesIO(file_bytes))
     bookings = {}
@@ -624,8 +646,6 @@ def parse_dhl_workbook(file_bytes):
         if raw.empty or raw.shape[1] < 2:
             continue
 
-        # FIX: Some workbook versions put the week date in A6.
-        # Search the first 10 rows, but do not scan the entire sheet.
         week_start = None
 
         for row_index in range(min(10, raw.shape[0])):
@@ -675,18 +695,12 @@ def parse_dhl_workbook(file_bytes):
                 if parsed_time is None:
                     continue
 
-                hourly_columns.append(
-                    (col, time(parsed_time.hour, 0))
-                )
+                hourly_columns.append((col, time(parsed_time.hour, 0)))
 
             if not hourly_columns:
                 continue
 
-            # Read rows beneath this weekday until the next weekday.
-            for row_index in range(
-                header_row + 1,
-                len(raw.index),
-            ):
+            for row_index in range(header_row + 1, len(raw.index)):
                 row_label = clean_cell(
                     raw.iat[row_index, 0]
                 ).upper()
@@ -707,12 +721,7 @@ def parse_dhl_workbook(file_bytes):
                     ).replace(tzinfo=UK)
 
                     title = "DHL Collection - Pontefract"
-
-                    key = make_booking_key(
-                        title,
-                        start_dt,
-                        "DHL",
-                    )
+                    key = make_booking_key(title, start_dt, "DHL")
 
                     bookings[key] = {
                         "title": title,
@@ -849,7 +858,10 @@ def get_sent_loads():
 
 
 def decorate_events(events, sent_loads, now):
-    """Apply sent/overdue colours to Campey events only."""
+    """
+    Campey keeps its original sent/overdue colouring.
+    Bulk and DHL use saved status colours.
+    """
     loads_by_day = {}
 
     for load in sent_loads:
@@ -870,6 +882,7 @@ def decorate_events(events, sent_loads, now):
 
     decorated = []
 
+    # Campey behaviour intentionally unchanged.
     for day, bookings in campey_by_day.items():
         bookings.sort(
             key=lambda pair: (pair[0], str(pair[1].get("id", "")))
@@ -896,19 +909,37 @@ def decorate_events(events, sent_loads, now):
 
             decorated.append(item)
 
-    # Non-Campey sources keep their saved title and colour.
+    # Non-Campey sources.
     for event in events:
         if event.get("source", "Manual") == "Campey":
             continue
 
         item = dict(event)
-        item["_display_title"] = item.get("title", "")
+        source = item.get("source", "Manual")
+        status = item.get("status", "scheduled")
+
         item["_sent"] = False
         item["_sent_filename"] = ""
-        item["_display_colour"] = (
-            item.get("colour")
-            or SOURCE_COLOURS.get(item.get("source", "Manual"), PURPLE)
-        )
+
+        display_title = item.get("title", "")
+
+        # Show the saved DHL load header on the calendar.
+        if source == "DHL" and item.get("load_header"):
+            display_title = (
+                f"{display_title} · {item['load_header']}"
+            )
+
+        item["_display_title"] = display_title
+
+        if source in ("Bulk", "DHL") and status == "complete":
+            item["_display_colour"] = GREEN
+        elif source in ("Bulk", "DHL") and status == "cancelled":
+            item["_display_colour"] = RED
+        else:
+            item["_display_colour"] = (
+                item.get("colour")
+                or SOURCE_COLOURS.get(source, PURPLE)
+            )
 
         decorated.append(item)
 
@@ -917,7 +948,6 @@ def decorate_events(events, sent_loads, now):
 
 # ============================================================
 # IMPORT HELPER
-# Re-scans files and skips matching existing events.
 # ============================================================
 
 def import_bookings(parsed, file_hash, filename):
@@ -957,6 +987,7 @@ def import_bookings(parsed, file_hash, filename):
             "end": row["end"].isoformat() if row.get("end") else None,
             "source": source,
             "colour": SOURCE_COLOURS.get(source, PURPLE),
+            "status": "scheduled",
         })
 
         existing_keys.add(key)
@@ -1021,8 +1052,8 @@ m3.metric("Past unmatched Campey bookings", overdue_count)
 with st.expander("Calendar colour key"):
     st.markdown(
         f'<span style="color:{BLUE}">■</span> Upcoming Campey &nbsp; '
-        f'<span style="color:{GREEN}">■</span> Campey sent &nbsp; '
-        f'<span style="color:{RED}">■</span> Campey overdue &nbsp; '
+        f'<span style="color:{GREEN}">■</span> Complete / Campey sent &nbsp; '
+        f'<span style="color:{RED}">■</span> Cancelled / Campey overdue &nbsp; '
         f'<span style="color:{AMBER}">■</span> Bulk Inbound &nbsp; '
         f'<span style="color:{PURPLE}">■</span> Manual &nbsp; '
         f'<span style="color:{DHL_COLOUR}">■</span> DHL Collection',
@@ -1052,17 +1083,24 @@ for event in display_events:
         "backgroundColor": colour,
         "borderColor": colour,
         "extendedProps": {
-            "source": SOURCE_LABELS.get(
+            "source": event.get("source", "Manual"),
+            "sourceLabel": SOURCE_LABELS.get(
                 event.get("source", "Manual"),
                 event.get("source", "Manual"),
             ),
             "originalTitle": event.get("title", ""),
+            "status": event.get("status", "scheduled"),
+            "loadHeader": event.get("load_header") or "",
             "sent": event.get("_sent", False),
             "sentFilename": event.get("_sent_filename", ""),
         },
     })
 
-calendar(
+# ============================================================
+# CALENDAR WITH EVENT-CLICK STATUS CONTROLS
+# ============================================================
+
+calendar_result = calendar(
     events=calendar_events,
     options={
         "initialView": "dayGridMonth",
@@ -1082,8 +1120,150 @@ calendar(
         "firstDay": 1,
         "timeZone": "local",
     },
+    callbacks=["eventClick"],
     key="dds_transport_calendar",
 )
+
+# The calendar click callback returns the clicked event's ID.
+if isinstance(calendar_result, dict):
+    clicked_event = (
+        calendar_result.get("eventClick", {})
+        .get("event", {})
+    )
+
+    clicked_event_id = clicked_event.get("id")
+
+    if clicked_event_id:
+        clicked_event_id = str(clicked_event_id)
+        clicked_booking = next(
+            (
+                event for event in events
+                if str(event.get("id", "")) == clicked_event_id
+            ),
+            None,
+        )
+
+        if clicked_booking and clicked_booking.get("source") in (
+            "Bulk",
+            "DHL",
+        ):
+            st.session_state["selected_status_event_id"] = (
+                clicked_event_id
+            )
+
+# ============================================================
+# STATUS PANEL FOR BULK AND DHL
+# ============================================================
+
+selected_status_id = st.session_state.get(
+    "selected_status_event_id"
+)
+
+selected_status_event = next(
+    (
+        event for event in events
+        if str(event.get("id", "")) == str(selected_status_id)
+    ),
+    None,
+)
+
+if selected_status_event and selected_status_event.get("source") in (
+    "Bulk",
+    "DHL",
+):
+    status_source = selected_status_event.get("source")
+    status_title = selected_status_event.get("title", "(untitled)")
+    current_status = selected_status_event.get("status", "scheduled")
+
+    if current_status not in STATUS_OPTIONS:
+        current_status = "scheduled"
+
+    status_start = local_datetime(selected_status_event.get("start"))
+    status_date = (
+        status_start.strftime("%d/%m/%Y %H:%M")
+        if status_start else "Date not available"
+    )
+
+    st.subheader("📋 Update booking status")
+    st.write(f"**Booking:** {status_title}")
+    st.write(f"**Source:** {SOURCE_LABELS.get(status_source, status_source)}")
+    st.write(f"**Date/time:** {status_date}")
+
+    with st.form("update_booking_status"):
+        new_status = st.selectbox(
+            "Status",
+            STATUS_OPTIONS,
+            index=STATUS_OPTIONS.index(current_status),
+            format_func=lambda value: {
+                "scheduled": "Scheduled",
+                "complete": "Complete — green",
+                "cancelled": "Cancelled — red",
+            }[value],
+        )
+
+        load_header_value = ""
+
+        if status_source == "DHL":
+            load_header_value = st.text_input(
+                "DHL load header",
+                value=selected_status_event.get("load_header") or "",
+                placeholder="Enter the load header/reference",
+                help="Required when marking a DHL collection as complete.",
+            )
+
+        save_status_clicked = st.form_submit_button(
+            "Save status",
+            type="primary",
+        )
+
+        if save_status_clicked:
+            if (
+                status_source == "DHL"
+                and new_status == "complete"
+                and not load_header_value.strip()
+            ):
+                st.error(
+                    "Please enter the DHL load header before marking "
+                    "this collection as complete."
+                )
+            else:
+                try:
+                    update_event_status(
+                        selected_status_event["id"],
+                        new_status,
+                        (
+                            load_header_value
+                            if status_source == "DHL"
+                            else None
+                        ),
+                    )
+
+                    st.session_state.pop(
+                        "selected_status_event_id",
+                        None,
+                    )
+
+                    st.success(
+                        f"Booking marked as {new_status}."
+                    )
+                    st.rerun()
+
+                except Exception as exc:
+                    st.error(
+                        f"Could not update booking status: {exc}"
+                    )
+
+    if st.button(
+        "Close status panel",
+        key="close_status_panel",
+    ):
+        st.session_state.pop("selected_status_event_id", None)
+        st.rerun()
+
+elif selected_status_id:
+    # Clear stale selections if the booking was deleted or is not
+    # a Bulk/DHL booking.
+    st.session_state.pop("selected_status_event_id", None)
 
 
 # ============================================================
@@ -1111,7 +1291,10 @@ with st.expander("➕ Add a booking"):
             step=0.25,
         )
 
-        add_clicked = st.form_submit_button("Add booking", type="primary")
+        add_clicked = st.form_submit_button(
+            "Add booking",
+            type="primary",
+        )
 
         if add_clicked:
             if not title.strip():
@@ -1215,8 +1398,8 @@ with st.expander("📥 Import Campey transport workbook"):
 
 with st.expander("📦 Import Bulk Inbound schedule"):
     st.write(
-        "Each timed row becomes a booking. Bulk events remain amber "
-        "and are not affected by Campey sent-load matching."
+        "Each timed row becomes a booking. Bulk events can be marked "
+        "complete or cancelled from the calendar."
     )
 
     bulk_file = st.file_uploader(
@@ -1308,9 +1491,7 @@ with st.expander("🚚 Bulk import DHL collections — Pontefract"):
         dhl_hash = hashlib.sha256(dhl_bytes).hexdigest()
 
         try:
-            already_imported = (
-                dhl_hash in get_imported_hashes()
-            )
+            already_imported = dhl_hash in get_imported_hashes()
         except Exception:
             already_imported = False
 
@@ -1324,7 +1505,6 @@ with st.expander("🚚 Bulk import DHL collections — Pontefract"):
             parsed_dhl = parse_dhl_workbook(dhl_bytes)
 
             if parsed_dhl:
-                # Group counts by Sunday-start calendar week.
                 weekly_counts = {}
 
                 for item in parsed_dhl:
@@ -1342,9 +1522,7 @@ with st.expander("🚚 Bulk import DHL collections — Pontefract"):
                         "Week commencing": week_start.strftime("%d/%m/%Y"),
                         "Collections found": count,
                     }
-                    for week_start, count in sorted(
-                        weekly_counts.items()
-                    )
+                    for week_start, count in sorted(weekly_counts.items())
                 ]
 
                 st.write(
@@ -1566,8 +1744,8 @@ with st.expander("📄 Campey sent-load CSV details"):
         )
 
     st.caption(
-        "Only Campey bookings receive green sent or red overdue status. "
-        "Bulk Inbound remains amber and DHL collections remain teal."
+        "Campey bookings retain their original sent/overdue behaviour. "
+        "Bulk and DHL bookings can be marked complete or cancelled."
     )
 
 st.caption(
