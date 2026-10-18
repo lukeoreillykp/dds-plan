@@ -1,1004 +1,48 @@
 import hashlib
-import io
-import re
-import uuid
 from datetime import date, datetime, time, timedelta
-from zoneinfo import ZoneInfo
 
 import pandas as pd
-import requests
 import streamlit as st
-from supabase import create_client
-from streamlit_calendar import calendar
 
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
+# Must be called before other code configures the Streamlit page.
 st.set_page_config(
     page_title="DDS Transport Calendar",
     page_icon="🚚",
     layout="wide",
 )
 
-UK = ZoneInfo("Europe/London")
+from streamlit_calendar import calendar
 
-SENDER_REPO = "lukeoreillykp/Kp-to-campeys-sscc-conversion"
-SAVED_LOADS_API = (
-    f"https://api.github.com/repos/{SENDER_REPO}/contents/saved_loads"
+from config import (
+    UK,
+    BLUE,
+    GREEN,
+    RED,
+    PURPLE,
+    AMBER,
+    DHL_COLOUR,
+    SOURCE_COLOURS,
+    SOURCE_LABELS,
+    STATUS_OPTIONS,
+    SENDER_REPO,
 )
 
-BLUE = "#2878c8"
-GREEN = "#239653"
-RED = "#d64545"
-PURPLE = "#7b61a8"
-AMBER = "#e0a126"
-DHL_COLOUR = "#159eaa"
-
-SOURCE_COLOURS = {
-    "Campey": BLUE,
-    "Bulk": AMBER,
-    "Manual": PURPLE,
-    "DHL": DHL_COLOUR,
-}
-
-SOURCE_LABELS = {
-    "Campey": "Campey",
-    "Bulk": "Bulk Inbound",
-    "Manual": "Manual",
-    "DHL": "DHL Collection",
-}
-
-STATUS_OPTIONS = ["scheduled", "complete", "cancelled"]
-
-
-# ============================================================
-# GENERAL HELPERS
-# ============================================================
-
-def local_datetime(value):
-    if value is None or value == "":
-        return None
-
-    try:
-        result = pd.to_datetime(value, errors="coerce")
-
-        if pd.isna(result):
-            return None
-
-        result = result.to_pydatetime()
-
-        if result.tzinfo is None:
-            return result.replace(tzinfo=UK)
-
-        return result.astimezone(UK)
-
-    except Exception:
-        return None
-
-
-def parse_date(value):
-    if value is None:
-        return None
-
-    try:
-        if pd.isna(value):
-            return None
-    except (TypeError, ValueError):
-        pass
-
-    try:
-        if isinstance(value, (datetime, date, pd.Timestamp)):
-            return pd.Timestamp(value).date()
-
-        result = pd.to_datetime(
-            value,
-            dayfirst=True,
-            errors="coerce",
-        )
-
-        return None if pd.isna(result) else result.date()
-
-    except Exception:
-        return None
-
-
-def parse_time(value):
-    """
-    Supports Excel time fractions, whole hours, decimal-style times
-    such as 13.3 = 13:30, and text times such as 08:30.
-    """
-    if value is None:
-        return None
-
-    try:
-        if pd.isna(value):
-            return None
-    except (TypeError, ValueError):
-        pass
-
-    if isinstance(value, time):
-        return value.replace(tzinfo=None)
-
-    if isinstance(value, (datetime, pd.Timestamp)):
-        return value.time().replace(tzinfo=None)
-
-    try:
-        number = float(value)
-
-        if 0 <= number < 1:
-            seconds = round(number * 86400)
-            return (datetime.min + timedelta(seconds=seconds)).time()
-
-        if 0 <= number < 24:
-            if number.is_integer():
-                return time(int(number), 0)
-
-            text = str(value).strip()
-
-            if "." in text:
-                whole, decimal = text.split(".", 1)
-                hour = int(whole)
-
-                if len(decimal) == 1:
-                    minute = int(decimal) * 10
-                else:
-                    minute = int(decimal[:2].ljust(2, "0"))
-
-                if 0 <= hour < 24 and 0 <= minute < 60:
-                    return time(hour, minute)
-
-    except (ValueError, TypeError, OverflowError):
-        pass
-
-    try:
-        text = str(value).strip()
-        match = re.fullmatch(r"(\d{1,2})[:.](\d{2})", text)
-
-        if match:
-            hour = int(match.group(1))
-            minute = int(match.group(2))
-
-            if 0 <= hour < 24 and 0 <= minute < 60:
-                return time(hour, minute)
-
-        result = pd.to_datetime(text, errors="coerce")
-
-        if not pd.isna(result):
-            return result.to_pydatetime().time().replace(tzinfo=None)
-
-    except Exception:
-        pass
-
-    return None
-
-
-def clean_cell(value):
-    if value is None:
-        return ""
-
-    try:
-        if pd.isna(value):
-            return ""
-    except (TypeError, ValueError):
-        pass
-
-    if isinstance(value, float) and value.is_integer():
-        return str(int(value))
-
-    return str(value).strip()
-
-
-def make_booking_key(title, start_dt, source):
-    return (
-        str(title).strip().casefold(),
-        start_dt.isoformat(),
-        source,
-    )
-
-
-# ============================================================
-# SUPABASE
-# ============================================================
-
-@st.cache_resource
-def get_supabase():
-    url = st.secrets.get("SUPABASE_URL")
-    key = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY")
-
-    if not url or not key:
-        st.error(
-            "Supabase credentials are missing. Add SUPABASE_URL and "
-            "SUPABASE_SERVICE_ROLE_KEY under Streamlit Cloud → "
-            "App settings → Secrets."
-        )
-        st.stop()
-
-    return create_client(url, key)
-
-
-supabase = get_supabase()
-
-
-def get_events():
-    """Fetch every event from Supabase in batches of 1,000."""
-    all_events = []
-    page_size = 1000
-    start = 0
-
-    while True:
-        response = (
-            supabase.table("events")
-            .select(
-                "id,title,start,end,colour,source,created_at,"
-                "status,load_header"
-            )
-            .order("start")
-            .order("id")
-            .range(start, start + page_size - 1)
-            .execute()
-        )
-
-        batch = response.data or []
-        all_events.extend(batch)
-
-        if len(batch) < page_size:
-            break
-
-        start += page_size
-
-    # Protect against older rows or unexpected null values.
-    for event in all_events:
-        if not event.get("status"):
-            event["status"] = "scheduled"
-
-    return all_events
-
-
-def get_imported_hashes():
-    response = (
-        supabase.table("imported_files")
-        .select("file_hash")
-        .execute()
-    )
-
-    return {row["file_hash"] for row in (response.data or [])}
-
-
-def remember_import(file_hash, filename):
-    supabase.table("imported_files").upsert({
-        "file_hash": file_hash,
-        "filename": filename,
-        "imported_at": datetime.now(UK).isoformat(),
-    }).execute()
-
-
-def save_event(
-    title,
-    start_dt,
-    end_dt,
-    source,
-    event_id=None,
-    status=None,
-    load_header=None,
-):
-    payload = {
-        "title": title.strip(),
-        "start": start_dt.astimezone(UK).isoformat(),
-        "end": end_dt.astimezone(UK).isoformat() if end_dt else None,
-        "source": source,
-        "colour": SOURCE_COLOURS.get(source, PURPLE),
-    }
-
-    # Only change status/header when explicitly supplied.
-    # Ordinary edits therefore preserve existing status.
-    if status is not None:
-        payload["status"] = status
-
-    if load_header is not None:
-        payload["load_header"] = load_header.strip() or None
-
-    if event_id:
-        supabase.table("events").update(payload).eq(
-            "id", event_id
-        ).execute()
-    else:
-        payload["id"] = str(uuid.uuid4())
-        supabase.table("events").insert(payload).execute()
-
-
-def update_event_status(event_id, status, load_header=None):
-    """Update a Bulk/DHL status without changing its booking details."""
-    payload = {"status": status}
-
-    if load_header is not None:
-        payload["load_header"] = load_header.strip() or None
-
-    supabase.table("events").update(payload).eq(
-        "id", event_id
-    ).execute()
-
-
-# ============================================================
-# CAMPEY WORKBOOK IMPORT
-# ============================================================
-
-def parse_campey_workbook(file_bytes):
-    workbook = pd.ExcelFile(io.BytesIO(file_bytes))
-    bookings = {}
-
-    for sheet_name in workbook.sheet_names:
-        raw = pd.read_excel(
-            workbook,
-            sheet_name=sheet_name,
-            header=None,
-        )
-
-        header_row = None
-
-        for index, row in raw.iterrows():
-            values = [
-                str(value).strip().lower()
-                for value in row.tolist()
-                if not pd.isna(value)
-            ]
-
-            has_date = any(
-                value == "date" or value.startswith("date ")
-                for value in values
-            )
-            has_time = any("planned time" in value for value in values)
-
-            if has_date and has_time:
-                header_row = index
-                break
-
-        if header_row is None:
-            continue
-
-        headers = [
-            "" if pd.isna(value) else str(value).strip()
-            for value in raw.iloc[header_row].tolist()
-        ]
-
-        data = raw.iloc[header_row + 1:].copy()
-        data.columns = headers
-
-        lookup = {
-            str(column).strip().lower(): column
-            for column in data.columns
-        }
-
-        date_col = next(
-            (
-                column for name, column in lookup.items()
-                if name == "date" or name.startswith("date ")
-            ),
-            None,
-        )
-
-        time_col = next(
-            (
-                column for name, column in lookup.items()
-                if "planned time" in name
-            ),
-            None,
-        )
-
-        site_col = next(
-            (
-                column for name, column in lookup.items()
-                if name in ("del site", "delivery site", "site")
-            ),
-            None,
-        )
-
-        if date_col is None or time_col is None or site_col is None:
-            continue
-
-        for _, row in data.iterrows():
-            booking_date = parse_date(row.get(date_col))
-            booking_time = parse_time(row.get(time_col))
-            site = row.get(site_col)
-
-            if booking_date is None or booking_time is None:
-                continue
-
-            if site is None or pd.isna(site):
-                continue
-
-            site = str(site).strip()
-
-            if not site or site.lower() in {"nan", "none", "del site"}:
-                continue
-
-            start_dt = datetime.combine(
-                booking_date, booking_time
-            ).replace(tzinfo=UK)
-
-            key = make_booking_key(site, start_dt, "Campey")
-
-            bookings[key] = {
-                "title": site,
-                "start": start_dt,
-                "end": start_dt + timedelta(hours=1),
-                "source": "Campey",
-                "colour": BLUE,
-            }
-
-    return list(bookings.values())
-
-
-# ============================================================
-# BULK INBOUND WORKBOOK IMPORT
-# ============================================================
-
-def parse_bulk_workbook(file_bytes):
-    """
-    Each weekday uses a four-column group:
-    time | supplier/details | product/code | quantity/extra details.
-
-    The date is stored in row 0 of the second column in each group.
-    """
-    workbook = pd.ExcelFile(io.BytesIO(file_bytes))
-    bookings = {}
-
-    for sheet_name in workbook.sheet_names:
-        if sheet_name.strip().lower() in {"maris", "rejected"}:
-            continue
-
-        raw = pd.read_excel(
-            workbook,
-            sheet_name=sheet_name,
-            header=None,
-        )
-
-        if raw.empty or len(raw.index) < 4:
-            continue
-
-        for base_col in (0, 4, 8, 12, 16):
-            date_col = base_col + 1
-
-            if date_col >= raw.shape[1]:
-                continue
-
-            booking_date = parse_date(raw.iat[0, date_col])
-
-            if booking_date is None:
-                continue
-
-            for row_index in range(3, len(raw.index)):
-                booking_time = parse_time(raw.iat[row_index, base_col])
-
-                if booking_time is None:
-                    continue
-
-                details = []
-
-                for col_index in range(
-                    base_col + 1,
-                    min(base_col + 4, raw.shape[1]),
-                ):
-                    value = clean_cell(raw.iat[row_index, col_index])
-
-                    if value:
-                        details.append(value)
-
-                if not details:
-                    continue
-
-                title = " · ".join(details)
-                title_lower = title.casefold()
-
-                if any(
-                    phrase in title_lower
-                    for phrase in (
-                        "no deliveries",
-                        "bank holiday",
-                        "engagement day",
-                    )
-                ):
-                    continue
-
-                start_dt = datetime.combine(
-                    booking_date, booking_time
-                ).replace(tzinfo=UK)
-
-                key = make_booking_key(title, start_dt, "Bulk")
-
-                bookings[key] = {
-                    "title": title,
-                    "start": start_dt,
-                    "end": start_dt + timedelta(hours=1),
-                    "source": "Bulk",
-                    "colour": AMBER,
-                }
-
-    return list(bookings.values())
-
-
-# ============================================================
-# DHL PONTEFRACT WORKBOOK IMPORT
-# ============================================================
-
-def parse_dhl_header_date(value):
-    """
-    Parse a week date from the worksheet header area.
-    UK day/month/year formats are tried before US formats.
-    """
-    if value is None:
-        return None
-
-    try:
-        if pd.isna(value):
-            return None
-    except (TypeError, ValueError):
-        pass
-
-    if isinstance(value, (datetime, date, pd.Timestamp)):
-        return pd.Timestamp(value).date()
-
-    if isinstance(value, (int, float)):
-        if 20000 <= value <= 80000:
-            try:
-                return (
-                    pd.Timestamp("1899-12-30")
-                    + pd.to_timedelta(value, unit="D")
-                ).date()
-            except (TypeError, ValueError, OverflowError):
-                return None
-
-        return None
-
-    text = clean_cell(value)
-
-    if not text:
-        return None
-
-    for fmt in (
-        "%d/%m/%Y",
-        "%d/%m/%y",
-        "%d-%m-%Y",
-        "%d-%m-%y",
-        "%m/%d/%Y",
-        "%m/%d/%y",
-        "%m-%d-%Y",
-        "%m-%d-%y",
-        "%Y-%m-%d",
-    ):
-        try:
-            return datetime.strptime(text, fmt).date()
-        except ValueError:
-            continue
-
-    return None
-
-
-def get_week_start_from_sheet(sheet_name):
-    """Compatibility helper for worksheet names that contain a date."""
-    match = re.search(
-        r"W\s*\.?\s*C\s*\.?\s*[-:]?\s*(\d{6}|\d{8})",
-        sheet_name,
-        re.IGNORECASE,
-    )
-
-    if not match:
-        return None
-
-    value = match.group(1)
-
-    formats = (
-        ("%d%m%Y", "%Y%m%d")
-        if len(value) == 8
-        else ("%d%m%y", "%y%m%d")
-    )
-
-    for fmt in formats:
-        try:
-            return datetime.strptime(value, fmt).date()
-        except ValueError:
-            continue
-
-    return None
-
-
-def is_one(value):
-    """Return True only for a numeric cell whose value is exactly 1."""
-    if value is None:
-        return False
-
-    try:
-        if pd.isna(value):
-            return False
-
-        return float(value) == 1
-    except (TypeError, ValueError):
-        return False
-
-
-def parse_dhl_workbook(file_bytes):
-    """
-    Parse every weekly worksheet in the Factory Movements workbook.
-    Only PONTEFRACT rows are imported. Hourly cells containing exactly
-    1 create DHL Collection events. TOTAL columns are ignored.
-    """
-    workbook = pd.ExcelFile(io.BytesIO(file_bytes))
-    bookings = {}
-
-    weekday_offsets = {
-        "SUN": 0,
-        "MON": 1,
-        "TUE": 2,
-        "WED": 3,
-        "THU": 4,
-        "FRI": 5,
-        "SAT": 6,
-    }
-
-    for sheet_name in workbook.sheet_names:
-        raw = pd.read_excel(
-            workbook,
-            sheet_name=sheet_name,
-            header=None,
-        )
-
-        if raw.empty or raw.shape[1] < 2:
-            continue
-
-        week_start = None
-
-        for row_index in range(min(10, raw.shape[0])):
-            for col_index in range(min(5, raw.shape[1])):
-                candidate = parse_dhl_header_date(
-                    raw.iat[row_index, col_index]
-                )
-
-                if candidate is not None:
-                    week_start = candidate
-                    break
-
-            if week_start is not None:
-                break
-
-        if week_start is None:
-            continue
-
-        for header_row in range(len(raw.index)):
-            first_cell = clean_cell(
-                raw.iat[header_row, 0]
-            ).upper()
-
-            day_key = first_cell[:3]
-
-            if day_key not in weekday_offsets:
-                continue
-
-            collection_date = week_start + timedelta(
-                days=weekday_offsets[day_key]
-            )
-
-            hourly_columns = []
-
-            for col in range(1, raw.shape[1]):
-                heading = raw.iat[header_row, col]
-                heading_text = clean_cell(heading).upper()
-
-                if not heading_text or "TOTAL" in heading_text:
-                    continue
-
-                if parse_dhl_header_date(heading) is not None:
-                    continue
-
-                parsed_time = parse_time(heading)
-
-                if parsed_time is None:
-                    continue
-
-                hourly_columns.append((col, time(parsed_time.hour, 0)))
-
-            if not hourly_columns:
-                continue
-
-            for row_index in range(header_row + 1, len(raw.index)):
-                row_label = clean_cell(
-                    raw.iat[row_index, 0]
-                ).upper()
-
-                if row_label[:3] in weekday_offsets:
-                    break
-
-                if not row_label.startswith("PONTEFRACT"):
-                    continue
-
-                for col, hour in hourly_columns:
-                    if not is_one(raw.iat[row_index, col]):
-                        continue
-
-                    start_dt = datetime.combine(
-                        collection_date,
-                        hour,
-                    ).replace(tzinfo=UK)
-
-                    title = "DHL Collection - Pontefract"
-                    key = make_booking_key(title, start_dt, "DHL")
-
-                    bookings[key] = {
-                        "title": title,
-                        "start": start_dt,
-                        "end": start_dt + timedelta(hours=1),
-                        "source": "DHL",
-                        "colour": DHL_COLOUR,
-                    }
-
-    return sorted(
-        bookings.values(),
-        key=lambda item: item["start"],
-    )
-
-
-# ============================================================
-# SENT-LOAD CSV CHECK — CAMPEY ONLY
-# ============================================================
-
-@st.cache_data(ttl=60, show_spinner=False)
-def get_sent_loads():
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "DDS-Transport-Calendar",
-    }
-
-    response = requests.get(
-        SAVED_LOADS_API,
-        headers=headers,
-        timeout=20,
-    )
-    response.raise_for_status()
-
-    loads = []
-
-    for item in response.json():
-        filename = item.get("name", "")
-
-        if (
-            item.get("type") != "file"
-            or not filename.lower().endswith(".csv")
-        ):
-            continue
-
-        download_url = item.get("download_url")
-
-        if not download_url:
-            continue
-
-        csv_response = requests.get(
-            download_url,
-            headers={"User-Agent": "DDS-Transport-Calendar"},
-            timeout=20,
-        )
-        csv_response.raise_for_status()
-
-        try:
-            frame = pd.read_csv(
-                io.BytesIO(csv_response.content),
-                dtype=str,
-            )
-        except Exception:
-            continue
-
-        if frame.empty:
-            continue
-
-        columns = {
-            str(column).strip().lower(): column
-            for column in frame.columns
-        }
-
-        ref_col = columns.get("load ref")
-        date_col = columns.get("date")
-
-        if not ref_col:
-            continue
-
-        refs = frame[ref_col].dropna().astype(str).str.strip()
-        refs = refs[refs != ""]
-
-        if refs.empty:
-            continue
-
-        load_ref = refs.iloc[0]
-        sent_at = None
-
-        if date_col:
-            dates = frame[date_col].dropna().astype(str).str.strip()
-            dates = dates[dates != ""]
-
-            if not dates.empty:
-                parsed = pd.to_datetime(
-                    dates.iloc[0],
-                    dayfirst=True,
-                    errors="coerce",
-                )
-
-                if not pd.isna(parsed):
-                    sent_at = parsed.to_pydatetime()
-
-        if sent_at is None:
-            match = re.search(
-                r"_(\d{8})_(\d{6})\.csv$",
-                filename,
-                re.IGNORECASE,
-            )
-
-            if match:
-                try:
-                    sent_at = datetime.strptime(
-                        match.group(1) + match.group(2),
-                        "%Y%m%d%H%M%S",
-                    )
-                except ValueError:
-                    pass
-
-        if sent_at is None:
-            continue
-
-        if sent_at.tzinfo is None:
-            sent_at = sent_at.replace(tzinfo=UK)
-        else:
-            sent_at = sent_at.astimezone(UK)
-
-        loads.append({
-            "load_ref": load_ref,
-            "sent_at": sent_at,
-            "filename": filename,
-        })
-
-    loads.sort(key=lambda load: (load["sent_at"], load["filename"]))
-    return loads
-
-
-def decorate_events(events, sent_loads, now):
-    """
-    Campey keeps its original sent/overdue colouring.
-    Bulk and DHL use saved status colours.
-    """
-    loads_by_day = {}
-
-    for load in sent_loads:
-        loads_by_day.setdefault(load["sent_at"].date(), []).append(load)
-
-    campey_by_day = {}
-
-    for event in events:
-        if event.get("source", "Manual") != "Campey":
-            continue
-
-        start_dt = local_datetime(event.get("start"))
-
-        if start_dt:
-            campey_by_day.setdefault(start_dt.date(), []).append(
-                (start_dt, event)
-            )
-
-    decorated = []
-
-    # Campey behaviour intentionally unchanged.
-    for day, bookings in campey_by_day.items():
-        bookings.sort(
-            key=lambda pair: (pair[0], str(pair[1].get("id", "")))
-        )
-
-        day_loads = loads_by_day.get(day, [])
-
-        for index, (start_dt, event) in enumerate(bookings):
-            item = dict(event)
-
-            if index < len(day_loads):
-                load = day_loads[index]
-                item["_display_title"] = load["load_ref"]
-                item["_display_colour"] = GREEN
-                item["_sent"] = True
-                item["_sent_filename"] = load["filename"]
-            else:
-                item["_display_title"] = event.get("title", "")
-                item["_sent"] = False
-                item["_sent_filename"] = ""
-                item["_display_colour"] = (
-                    RED if start_dt < now else BLUE
-                )
-
-            decorated.append(item)
-
-    # Non-Campey sources.
-    for event in events:
-        if event.get("source", "Manual") == "Campey":
-            continue
-
-        item = dict(event)
-        source = item.get("source", "Manual")
-        status = item.get("status", "scheduled")
-
-        item["_sent"] = False
-        item["_sent_filename"] = ""
-
-        display_title = item.get("title", "")
-
-        # Show the saved DHL load header on the calendar.
-        if source == "DHL" and item.get("load_header"):
-            display_title = (
-                f"{display_title} · {item['load_header']}"
-            )
-
-        item["_display_title"] = display_title
-
-        if source in ("Bulk", "DHL") and status == "complete":
-            item["_display_colour"] = GREEN
-        elif source in ("Bulk", "DHL") and status == "cancelled":
-            item["_display_colour"] = RED
-        else:
-            item["_display_colour"] = (
-                item.get("colour")
-                or SOURCE_COLOURS.get(source, PURPLE)
-            )
-
-        decorated.append(item)
-
-    return decorated
-
-
-# ============================================================
-# IMPORT HELPER
-# ============================================================
-
-def import_bookings(parsed, file_hash, filename):
-    existing = get_events()
-    existing_keys = set()
-
-    for event in existing:
-        start_dt = local_datetime(event.get("start"))
-
-        if start_dt:
-            existing_keys.add(
-                make_booking_key(
-                    event.get("title", ""),
-                    start_dt,
-                    event.get("source", "Manual"),
-                )
-            )
-
-    rows_to_insert = []
-
-    for row in parsed:
-        source = row["source"]
-
-        key = make_booking_key(
-            row["title"],
-            row["start"],
-            source,
-        )
-
-        if key in existing_keys:
-            continue
-
-        rows_to_insert.append({
-            "id": str(uuid.uuid4()),
-            "title": row["title"],
-            "start": row["start"].isoformat(),
-            "end": row["end"].isoformat() if row.get("end") else None,
-            "source": source,
-            "colour": SOURCE_COLOURS.get(source, PURPLE),
-            "status": "scheduled",
-        })
-
-        existing_keys.add(key)
-
-    for offset in range(0, len(rows_to_insert), 100):
-        supabase.table("events").insert(
-            rows_to_insert[offset:offset + 100]
-        ).execute()
-
-    remember_import(file_hash, filename)
-    return len(rows_to_insert)
+from parsers.campey import parse_campey_workbook
+from parsers.bulk import parse_bulk_workbook
+from parsers.dhl import parse_dhl_workbook
+
+from services.events import (
+    get_events,
+    get_imported_hashes,
+    save_event,
+    update_event_status,
+    supabase,
+)
+
+from services.imports import import_bookings
+from services.sent_loads import get_sent_loads
+from services.calendar_events import decorate_events
+from utils.dates import local_datetime
 
 
 # ============================================================
@@ -1034,7 +78,9 @@ if github_error:
         f"Details: {github_error}"
     )
 
-sent_count = sum(1 for event in display_events if event.get("_sent"))
+sent_count = sum(
+    1 for event in display_events if event.get("_sent")
+)
 
 overdue_count = sum(
     1
@@ -1060,6 +106,11 @@ with st.expander("Calendar colour key"):
         unsafe_allow_html=True,
     )
 
+
+# ============================================================
+# PREPARE CALENDAR EVENTS
+# ============================================================
+
 calendar_events = []
 
 for event in display_events:
@@ -1077,7 +128,10 @@ for event in display_events:
 
     calendar_events.append({
         "id": str(event.get("id", "")),
-        "title": event.get("_display_title", event.get("title", "")),
+        "title": event.get(
+            "_display_title",
+            event.get("title", ""),
+        ),
         "start": start_dt.isoformat(),
         "end": end_dt.isoformat(),
         "backgroundColor": colour,
@@ -1096,6 +150,7 @@ for event in display_events:
         },
     })
 
+
 # ============================================================
 # CALENDAR WITH EVENT-CLICK STATUS CONTROLS
 # ============================================================
@@ -1107,7 +162,9 @@ calendar_result = calendar(
         "headerToolbar": {
             "left": "prev,next today",
             "center": "title",
-            "right": "dayGridMonth,timeGridWeek,timeGridDay,listMonth",
+            "right": (
+                "dayGridMonth,timeGridWeek,timeGridDay,listMonth"
+            ),
         },
         "editable": False,
         "selectable": False,
@@ -1124,7 +181,6 @@ calendar_result = calendar(
     key="dds_transport_calendar",
 )
 
-# The calendar click callback returns the clicked event's ID.
 if isinstance(calendar_result, dict):
     clicked_event = (
         calendar_result.get("eventClick", {})
@@ -1135,9 +191,11 @@ if isinstance(calendar_result, dict):
 
     if clicked_event_id:
         clicked_event_id = str(clicked_event_id)
+
         clicked_booking = next(
             (
-                event for event in events
+                event
+                for event in events
                 if str(event.get("id", "")) == clicked_event_id
             ),
             None,
@@ -1151,6 +209,7 @@ if isinstance(calendar_result, dict):
                 clicked_event_id
             )
 
+
 # ============================================================
 # STATUS PANEL FOR BULK AND DHL
 # ============================================================
@@ -1161,7 +220,8 @@ selected_status_id = st.session_state.get(
 
 selected_status_event = next(
     (
-        event for event in events
+        event
+        for event in events
         if str(event.get("id", "")) == str(selected_status_id)
     ),
     None,
@@ -1178,15 +238,21 @@ if selected_status_event and selected_status_event.get("source") in (
     if current_status not in STATUS_OPTIONS:
         current_status = "scheduled"
 
-    status_start = local_datetime(selected_status_event.get("start"))
+    status_start = local_datetime(
+        selected_status_event.get("start")
+    )
     status_date = (
         status_start.strftime("%d/%m/%Y %H:%M")
-        if status_start else "Date not available"
+        if status_start
+        else "Date not available"
     )
 
     st.subheader("📋 Update booking status")
     st.write(f"**Booking:** {status_title}")
-    st.write(f"**Source:** {SOURCE_LABELS.get(status_source, status_source)}")
+    st.write(
+        f"**Source:** "
+        f"{SOURCE_LABELS.get(status_source, status_source)}"
+    )
     st.write(f"**Date/time:** {status_date}")
 
     with st.form("update_booking_status"):
@@ -1208,7 +274,9 @@ if selected_status_event and selected_status_event.get("source") in (
                 "DHL load header",
                 value=selected_status_event.get("load_header") or "",
                 placeholder="Enter the load header/reference",
-                help="Required when marking a DHL collection as complete.",
+                help=(
+                    "Required when marking a DHL collection as complete."
+                ),
             )
 
         save_status_clicked = st.form_submit_button(
@@ -1243,9 +311,7 @@ if selected_status_event and selected_status_event.get("source") in (
                         None,
                     )
 
-                    st.success(
-                        f"Booking marked as {new_status}."
-                    )
+                    st.success(f"Booking marked as {new_status}.")
                     st.rerun()
 
                 except Exception as exc:
@@ -1261,8 +327,6 @@ if selected_status_event and selected_status_event.get("source") in (
         st.rerun()
 
 elif selected_status_id:
-    # Clear stale selections if the booking was deleted or is not
-    # a Bulk/DHL booking.
     st.session_state.pop("selected_status_event_id", None)
 
 
@@ -1276,7 +340,10 @@ with st.expander("➕ Add a booking"):
 
         c1, c2 = st.columns(2)
         booking_date = c1.date_input("Date", value=date.today())
-        booking_time = c2.time_input("Planned time", value=time(8, 0))
+        booking_time = c2.time_input(
+            "Planned time",
+            value=time(8, 0),
+        )
 
         c3, c4 = st.columns(2)
         source_label = c3.selectbox(
@@ -1301,7 +368,8 @@ with st.expander("➕ Add a booking"):
                 st.error("Please enter booking details.")
             else:
                 start_dt = datetime.combine(
-                    booking_date, booking_time
+                    booking_date,
+                    booking_time,
                 ).replace(tzinfo=UK)
 
                 source = {
@@ -1323,6 +391,25 @@ with st.expander("➕ Add a booking"):
 
 
 # ============================================================
+# SHARED IMPORT HELPER UI
+# ============================================================
+
+def show_imported_hash_message(file_hash):
+    """Show whether this exact workbook was imported before."""
+    try:
+        if file_hash in get_imported_hashes():
+            st.info(
+                "This workbook was imported previously. Re-scanning "
+                "can add missing bookings; existing matching bookings "
+                "will be skipped."
+            )
+    except Exception as exc:
+        st.warning(
+            f"Could not check the import history: {exc}"
+        )
+
+
+# ============================================================
 # IMPORT CAMPEY WORKBOOK
 # ============================================================
 
@@ -1337,16 +424,7 @@ with st.expander("📥 Import Campey transport workbook"):
         file_bytes = campey_file.getvalue()
         file_hash = hashlib.sha256(file_bytes).hexdigest()
 
-        try:
-            already_imported = file_hash in get_imported_hashes()
-        except Exception:
-            already_imported = False
-
-        if already_imported:
-            st.info(
-                "This workbook was imported previously. You can re-scan "
-                "it to add missing bookings."
-            )
+        show_imported_hash_message(file_hash)
 
         try:
             parsed = parse_campey_workbook(file_bytes)
@@ -1373,7 +451,9 @@ with st.expander("📥 Import Campey transport workbook"):
                 ):
                     try:
                         count = import_bookings(
-                            parsed, file_hash, campey_file.name
+                            parsed,
+                            file_hash,
+                            campey_file.name,
                         )
                         st.success(
                             f"Added {count} new Campey bookings. "
@@ -1412,19 +492,11 @@ with st.expander("📦 Import Bulk Inbound schedule"):
         bulk_bytes = bulk_file.getvalue()
         bulk_hash = hashlib.sha256(bulk_bytes).hexdigest()
 
-        try:
-            already_imported = bulk_hash in get_imported_hashes()
-        except Exception:
-            already_imported = False
-
-        if already_imported:
-            st.info(
-                "This workbook was imported previously. Re-scanning "
-                "adds any missing bookings."
-            )
+        show_imported_hash_message(bulk_hash)
 
         try:
             parsed_bulk = parse_bulk_workbook(bulk_bytes)
+
             st.write(
                 f"Found **{len(parsed_bulk)}** timed Bulk Inbound entries."
             )
@@ -1450,7 +522,9 @@ with st.expander("📦 Import Bulk Inbound schedule"):
                 ):
                     try:
                         count = import_bookings(
-                            parsed_bulk, bulk_hash, bulk_file.name
+                            parsed_bulk,
+                            bulk_hash,
+                            bulk_file.name,
                         )
                         st.success(
                             f"Added {count} new Bulk Inbound entries. "
@@ -1466,7 +540,9 @@ with st.expander("📦 Import Bulk Inbound schedule"):
                 )
 
         except Exception as exc:
-            st.error(f"Could not read the Bulk Schedule workbook: {exc}")
+            st.error(
+                f"Could not read the Bulk Schedule workbook: {exc}"
+            )
 
 
 # ============================================================
@@ -1490,16 +566,7 @@ with st.expander("🚚 Bulk import DHL collections — Pontefract"):
         dhl_bytes = dhl_file.getvalue()
         dhl_hash = hashlib.sha256(dhl_bytes).hexdigest()
 
-        try:
-            already_imported = dhl_hash in get_imported_hashes()
-        except Exception:
-            already_imported = False
-
-        if already_imported:
-            st.info(
-                "This workbook was imported previously. Re-scanning "
-                "will add missing events and skip matching existing ones."
-            )
+        show_imported_hash_message(dhl_hash)
 
         try:
             parsed_dhl = parse_dhl_workbook(dhl_bytes)
@@ -1519,10 +586,14 @@ with st.expander("🚚 Bulk import DHL collections — Pontefract"):
 
                 preview_rows = [
                     {
-                        "Week commencing": week_start.strftime("%d/%m/%Y"),
+                        "Week commencing": week_start.strftime(
+                            "%d/%m/%Y"
+                        ),
                         "Collections found": count,
                     }
-                    for week_start, count in sorted(weekly_counts.items())
+                    for week_start, count in sorted(
+                        weekly_counts.items()
+                    )
                 ]
 
                 st.write(
@@ -1555,6 +626,7 @@ with st.expander("🚚 Bulk import DHL collections — Pontefract"):
                             f"{skipped_count} already existed · "
                             f"{len(weekly_counts)} weeks processed."
                         )
+                        st.rerun()
 
                     except Exception as exc:
                         st.error(f"DHL import failed: {exc}")
@@ -1562,9 +634,9 @@ with st.expander("🚚 Bulk import DHL collections — Pontefract"):
             else:
                 st.warning(
                     "No DHL collection slots were found. Check that "
-                    "each worksheet has its week date in the top-left "
-                    "header area, weekday headings, hourly columns, "
-                    "and PONTEFRACT rows."
+                    "each worksheet has its week date in the header "
+                    "area, weekday headings, hourly columns, and "
+                    "PONTEFRACT rows."
                 )
 
         except Exception as exc:
@@ -1591,7 +663,8 @@ with st.expander("✏️ Edit or delete a booking"):
             if start_dt:
                 label = (
                     f"{start_dt:%d/%m/%Y %H:%M} — "
-                    f"{event.get('title', '(untitled)')} [{source_label}]"
+                    f"{event.get('title', '(untitled)')} "
+                    f"[{source_label}]"
                 )
             else:
                 label = event.get("title", "(untitled)")
@@ -1604,7 +677,9 @@ with st.expander("✏️ Edit or delete a booking"):
         )
 
         selected = choices[selected_label]
-        selected_start = local_datetime(selected.get("start")) or now
+        selected_start = local_datetime(
+            selected.get("start")
+        ) or now
         selected_end = (
             local_datetime(selected.get("end"))
             or selected_start + timedelta(hours=1)
@@ -1638,7 +713,8 @@ with st.expander("✏️ Edit or delete a booking"):
 
             current_source = selected.get("source", "Manual")
             current_label = SOURCE_LABELS.get(
-                current_source, current_source
+                current_source,
+                current_source,
             )
 
             edit_source_label = ec3.selectbox(
@@ -1646,7 +722,8 @@ with st.expander("✏️ Edit or delete a booking"):
                 source_options,
                 index=(
                     source_options.index(current_label)
-                    if current_label in source_options else 0
+                    if current_label in source_options
+                    else 0
                 ),
                 key="edit_source",
             )
@@ -1674,7 +751,8 @@ with st.expander("✏️ Edit or delete a booking"):
                     st.error("Please enter booking details.")
                 else:
                     new_start = datetime.combine(
-                        edit_date, edit_time
+                        edit_date,
+                        edit_time,
                     ).replace(tzinfo=UK)
 
                     new_source = {
@@ -1686,7 +764,9 @@ with st.expander("✏️ Edit or delete a booking"):
                         save_event(
                             edit_title,
                             new_start,
-                            new_start + timedelta(hours=float(edit_duration)),
+                            new_start + timedelta(
+                                hours=float(edit_duration)
+                            ),
                             new_source,
                             event_id=selected["id"],
                         )
@@ -1706,7 +786,8 @@ with st.expander("✏️ Edit or delete a booking"):
         ):
             try:
                 supabase.table("events").delete().eq(
-                    "id", selected["id"]
+                    "id",
+                    selected["id"],
                 ).execute()
 
                 st.success("Booking deleted.")
@@ -1744,7 +825,7 @@ with st.expander("📄 Campey sent-load CSV details"):
         )
 
     st.caption(
-        "Campey bookings retain their original sent/overdue behaviour. "
+        "Campey bookings retain their sent/overdue behaviour. "
         "Bulk and DHL bookings can be marked complete or cancelled."
     )
 
