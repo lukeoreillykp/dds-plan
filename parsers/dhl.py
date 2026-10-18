@@ -1,4 +1,3 @@
-
 import io
 import re
 from datetime import date, datetime, time, timedelta
@@ -47,10 +46,14 @@ def parse_dhl_header_date(value):
         return None
 
     for fmt in (
-        "%d/%m/%Y", "%d/%m/%y",
-        "%d-%m-%Y", "%d-%m-%y",
-        "%m/%d/%Y", "%m/%d/%y",
-        "%m-%d-%Y", "%m-%d-%y",
+        "%d/%m/%Y",
+        "%d/%m/%y",
+        "%d-%m-%Y",
+        "%d-%m-%y",
+        "%m/%d/%Y",
+        "%m/%d/%y",
+        "%m-%d-%Y",
+        "%m-%d-%y",
         "%Y-%m-%d",
     ):
         try:
@@ -62,9 +65,9 @@ def parse_dhl_header_date(value):
 
 
 def get_week_start_from_sheet(sheet_name):
-    """Compatibility helper for worksheet names that contain a date."""
+    """Extract a week commencing date from a worksheet name."""
     match = re.search(
-        r"W\s*\.?\s*C\s*\.?\s*[-:]?\s*(\d{6}|\d{8})",
+        r"W\s*\.?\s*C\s*\.?\s*[-:]?\s*(\d{8}|\d{6})",
         sheet_name,
         re.IGNORECASE,
     )
@@ -74,11 +77,10 @@ def get_week_start_from_sheet(sheet_name):
 
     value = match.group(1)
 
-    formats = (
-        ("%d%m%Y", "%Y%m%d")
-        if len(value) == 8
-        else ("%d%m%y", "%y%m%d")
-    )
+    if len(value) == 8:
+        formats = ("%d%m%Y", "%Y%m%d")
+    else:
+        formats = ("%d%m%y", "%y%m%d")
 
     for fmt in formats:
         try:
@@ -91,7 +93,7 @@ def get_week_start_from_sheet(sheet_name):
 
 def is_one(value):
     """Return True only for a numeric cell whose value is exactly 1."""
-    if value is None:
+    if value is None or isinstance(value, (str, bool)):
         return False
 
     try:
@@ -105,8 +107,10 @@ def is_one(value):
 def parse_dhl_workbook(file_bytes):
     """
     Parse weekly worksheets in the Factory Movements workbook.
-    Only PONTEFRACT rows are imported. Hourly cells containing exactly
-    1 create DHL Collection events. TOTAL columns are ignored.
+
+    Only PONTEFRACT rows are imported. Hourly cells containing
+    exactly numeric 1 create DHL Collection events. TOTAL columns
+    and text values such as "1" are ignored.
     """
     workbook = pd.ExcelFile(io.BytesIO(file_bytes))
     bookings = {}
@@ -133,11 +137,13 @@ def parse_dhl_workbook(file_bytes):
 
         week_start = None
 
+        # Find the week commencing date near the top of the sheet.
         for row_index in range(min(10, raw.shape[0])):
             for col_index in range(min(5, raw.shape[1])):
                 candidate = parse_dhl_header_date(
                     raw.iat[row_index, col_index]
                 )
+
                 if candidate is not None:
                     week_start = candidate
                     break
@@ -152,6 +158,7 @@ def parse_dhl_workbook(file_bytes):
             first_cell = clean_cell(
                 raw.iat[header_row, 0]
             ).upper()
+
             day_key = first_cell[:3]
 
             if day_key not in weekday_offsets:
@@ -186,15 +193,18 @@ def parse_dhl_workbook(file_bytes):
                 continue
 
             for row_index in range(
-                header_row + 1, len(raw.index)
+                header_row + 1,
+                len(raw.index),
             ):
                 row_label = clean_cell(
                     raw.iat[row_index, 0]
                 ).upper()
 
+                # Stop when the next weekday section begins.
                 if row_label[:3] in weekday_offsets:
                     break
 
+                # Import only Pontefract rows.
                 if not row_label.startswith("PONTEFRACT"):
                     continue
 
@@ -203,12 +213,16 @@ def parse_dhl_workbook(file_bytes):
                         continue
 
                     start_dt = datetime.combine(
-                        collection_date, hour
+                        collection_date,
+                        hour,
                     ).replace(tzinfo=UK)
 
                     title = "DHL Collection - Pontefract"
+
                     key = make_booking_key(
-                        title, start_dt, "DHL"
+                        title,
+                        start_dt,
+                        "DHL",
                     )
 
                     bookings[key] = {
