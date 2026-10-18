@@ -1,1 +1,1 @@
-//comment
+# Package initialisation.
