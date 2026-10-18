@@ -10,6 +10,7 @@ UK = ZoneInfo("Europe/London")
 
 
 def local_datetime(value):
+    """Convert a value to a UK-localised datetime, or return None."""
     if value is None or value == "":
         return None
 
@@ -31,6 +32,7 @@ def local_datetime(value):
 
 
 def parse_date(value):
+    """Parse dates using UK day-first conventions."""
     if value is None:
         return None
 
@@ -81,7 +83,9 @@ def parse_time(value):
 
         if 0 <= number < 1:
             seconds = round(number * 86400)
-            return (datetime.min + timedelta(seconds=seconds)).time()
+            return (
+                datetime.min + timedelta(seconds=seconds)
+            ).time()
 
         if 0 <= number < 24:
             if number.is_integer():
@@ -106,6 +110,7 @@ def parse_time(value):
 
     try:
         text = str(value).strip()
+
         match = re.fullmatch(r"(\d{1,2})[:.](\d{2})", text)
 
         if match:
