@@ -1,3 +1,4 @@
+
 import hashlib
 from datetime import date, datetime, time, timedelta
 
@@ -108,12 +109,40 @@ with st.expander("Calendar colour key"):
 
 
 # ============================================================
-# PREPARE CALENDAR EVENTS
+# CALENDAR SOURCE FILTER
+# ============================================================
+
+st.subheader("Filter calendar")
+
+selected_sources = st.multiselect(
+    "Show booking sources",
+    options=["Bulk", "Campey", "DHL", "Manual"],
+    default=["Bulk", "Campey", "DHL", "Manual"],
+    format_func=lambda source: {
+        "Bulk": "Bulk",
+        "Campey": "Campey",
+        "DHL": "DHL",
+        "Manual": "Manual",
+    }[source],
+    help=(
+        "Choose one or more sources to display. "
+        "Clear the selection to show no bookings."
+    ),
+    key="calendar_source_filter",
+)
+
+
+# ============================================================
+# PREPARE FILTERED CALENDAR EVENTS
 # ============================================================
 
 calendar_events = []
 
 for event in display_events:
+    # Only include sources selected in the slicer.
+    if event.get("source", "Manual") not in selected_sources:
+        continue
+
     start_dt = local_datetime(event.get("start"))
 
     if not start_dt:
