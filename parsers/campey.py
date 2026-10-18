@@ -13,6 +13,7 @@ UK = ZoneInfo("Europe/London")
 BLUE = "#2878c8"
 
 
+
 def parse_campey_workbook(file_bytes):
     workbook = pd.ExcelFile(io.BytesIO(file_bytes))
     bookings = {}
