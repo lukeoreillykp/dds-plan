@@ -1,4 +1,3 @@
-
 import hashlib
 import io
 import re
@@ -516,8 +515,9 @@ def parse_dhl_header_date(value):
                     pd.Timestamp("1899-12-30")
                     + pd.to_timedelta(value, unit="D")
                 ).date()
-        except (TypeError, ValueError, OverflowError):
+            except (TypeError, ValueError, OverflowError):
                 return None
+
         return None
 
     text = clean_cell(value)
