@@ -1,4 +1,3 @@
-
 import hashlib
 from datetime import date, datetime, time, timedelta
 
@@ -37,11 +36,12 @@ from services.events import (
     get_imported_hashes,
     save_event,
     update_event_status,
+    update_campey_load_ref,
     supabase,
 )
 
 from services.imports import import_bookings
-from services.sent_loads import get_sent_loads
+from services.sent_loads import get_sent_loads, sync_sent_loads
 from services.calendar_events import decorate_events
 from utils.dates import local_datetime
 
@@ -61,26 +61,123 @@ except Exception as exc:
     st.error(f"Could not load bookings from Supabase: {exc}")
     st.stop()
 
+now = datetime.now(UK)
+
 github_error = None
+sync_errors = []
+match_save_errors = []
+
+# ============================================================
+# SYNC SAVED-LOAD CSVs INTO SUPABASE
+# ============================================================
+
+# Import any new CSVs from the sender repository into Supabase.
+# Existing records should be left intact by sync_sent_loads().
+try:
+    sync_result = sync_sent_loads()
+
+    if isinstance(sync_result, dict):
+        sync_errors = sync_result.get("errors", [])
+
+    # The sync may have inserted new records, so clear the cached
+    # result before loading the saved-load list again.
+    get_sent_loads.clear()
+
+except Exception as exc:
+    github_error = str(exc)
+
+
+# ============================================================
+# LOAD SENT-LOAD RECORDS
+# ============================================================
 
 try:
     sent_loads = get_sent_loads()
 except Exception as exc:
     sent_loads = []
-    github_error = str(exc)
+    if github_error:
+        github_error = f"{github_error}; {exc}"
+    else:
+        github_error = str(exc)
 
-now = datetime.now(UK)
 
-# decorate_events will match daily CSV loads to Campey bookings
-# and add virtual calendar events for unmatched CSVs.
+# ============================================================
+# MATCH CSVs TO CAMPEY BOOKINGS
+# ============================================================
+
+# decorate_events matches daily CSV loads to Campey bookings and
+# creates virtual calendar events for CSVs without a matching booking.
 display_events = decorate_events(events, sent_loads, now)
+
+# Persist new matches in Supabase. Existing saved references are not
+# overwritten, and virtual extra CSV entries are never saved as bookings.
+for event in display_events:
+    if event.get("source") != "Campey":
+        continue
+
+    if event.get("_is_extra", False):
+        continue
+
+    if not event.get("_sent", False):
+        continue
+
+    # Preserve any association already saved in Supabase.
+    if event.get("campey_load_ref"):
+        continue
+
+    event_id = event.get("id")
+    load_ref = str(event.get("_load_ref") or "").strip()
+
+    if not event_id or not load_ref:
+        continue
+
+    try:
+        update_campey_load_ref(event_id, load_ref)
+        event["campey_load_ref"] = load_ref
+
+    except Exception as exc:
+        match_save_errors.append(
+            f"{event.get('title', event_id)}: {exc}"
+        )
+
+
+# Reload bookings after saving references so the current page uses the
+# persisted associations, rather than relying only on in-memory values.
+try:
+    events = get_events()
+    display_events = decorate_events(events, sent_loads, now)
+
+except Exception as exc:
+    st.warning(
+        f"Could not reload saved Campey matches: {exc}"
+    )
+
+
+# ============================================================
+# SYNC AND MATCHING WARNINGS
+# ============================================================
 
 if github_error:
     st.warning(
-        "Could not check saved-load CSVs. "
-        "Campey sent/overdue colours and extra entries may be out of date. "
+        "Could not sync or read all saved-load CSV data. "
+        "Campey matching and extra entries may be out of date. "
         f"Details: {github_error}"
     )
+
+if sync_errors:
+    with st.expander("⚠️ CSV sync issues"):
+        for error in sync_errors:
+            st.warning(error)
+
+if match_save_errors:
+    st.warning(
+        "Some Campey matches could not be saved to Supabase. "
+        "Those matches may be recalculated on refresh."
+    )
+
+    with st.expander("Match-save errors"):
+        for error in match_save_errors:
+            st.warning(error)
 
 
 # ============================================================
