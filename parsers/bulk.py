@@ -24,7 +24,7 @@ def parse_bulk_workbook(file_bytes):
     bookings = {}
 
     for sheet_name in workbook.sheet_names:
-        if sheet_name.strip().lower() in {"maris", "rejected"}:
+        if sheet_name.strip().lower() in {"rejected"}:
             continue
 
         raw = pd.read_excel(
